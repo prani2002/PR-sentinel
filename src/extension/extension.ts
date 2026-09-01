@@ -3,7 +3,7 @@ import { registerCommands } from './commands';
 import { FindingsViewProvider } from '../ui/findingsView';
 
 /**
- * Extension activation entry point
+ * Extension entry point
  */
 export function activate(context: vscode.ExtensionContext): void {
   console.log('PR Sentinel extension is now active.');
