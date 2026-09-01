@@ -1,0 +1,6 @@
+{
+  "name": "PR Sentinel",
+  "description": "VS Code extension for detecting backend-to-frontend breaking changes in pull requests using TypeScript AST analysis and Gemini.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
