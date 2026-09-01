@@ -22,8 +22,13 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // Command to show/focus findings view in sidebar
   context.subscriptions.push(
-    vscode.commands.registerCommand('pr-sentinel.showFindings', () => {
-      vscode.commands.executeCommand('prSentinel.findingsView.focus');
+    vscode.commands.registerCommand('pr-sentinel.showFindings', async () => {
+      try {
+        await vscode.commands.executeCommand('workbench.view.extension.pr-sentinel');
+        await vscode.commands.executeCommand('prSentinel.findingsView.focus');
+      } catch (e) {
+        console.warn('Could not focus PR Sentinel view container:', e);
+      }
     })
   );
 }

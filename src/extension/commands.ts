@@ -9,8 +9,8 @@ import {
 import { parseAllChangedFiles } from '../github/pullRequest';
 import { DeterministicPipeline } from '../pipeline/deterministicPipeline';
 import { ProjectFileSource } from '../analyzer/projectScanner';
-import { FindingsViewProvider } from '../ui/findingsView';
-import { Finding } from '../models/types';
+import { FindingsViewProvider, FindingsPanel } from '../ui/findingsView';
+import { Finding, PullRequestInfo, ChangedFile } from '../models/types';
 
 /**
  * Discovers repository target from local git remotes if available
@@ -345,19 +345,36 @@ export function registerCommands(
             const pipeline = new DeterministicPipeline();
             const analysisResult = pipeline.run(prInfo, changedFiles, workspaceSources);
 
-            // 7. Update Findings View
+            // 7. Update Findings View & Panels
             if (findingsViewProvider) {
-              findingsViewProvider.updateFindings(analysisResult.findings, prInfo);
+              findingsViewProvider.updateFindings(analysisResult.findings, prInfo, changedFiles);
             }
 
             const breakingCount = analysisResult.metrics.breakingCount;
-            const warningCount = analysisResult.metrics.warningCount;
             const totalChanged = changedFiles.length;
 
             const summaryMessage =
               breakingCount > 0
                 ? `PR Sentinel: ⚠️ ${breakingCount} Breaking Change(s) detected in ${target.typeLabel} #${target.number} ("${prInfo.title}").`
                 : `PR Sentinel: ✅ ${target.typeLabel} #${target.number} analyzed successfully. 0 breaking changes across ${totalChanged} changed file(s).`;
+
+            // Function to display the blast radius details
+            const showBlastRadius = async () => {
+              try {
+                // 1. Open the interactive Blast Radius Editor Tab
+                FindingsPanel.createOrShow(
+                  context.extensionUri,
+                  analysisResult.findings,
+                  prInfo,
+                  changedFiles
+                );
+                // 2. Also open & focus the sidebar view
+                await vscode.commands.executeCommand('workbench.view.extension.pr-sentinel');
+                await vscode.commands.executeCommand('prSentinel.findingsView.focus');
+              } catch (openErr) {
+                console.warn('Could not focus sidebar container:', openErr);
+              }
+            };
 
             const choice = await vscode.window.showInformationMessage(
               summaryMessage,
@@ -366,7 +383,7 @@ export function registerCommands(
             );
 
             if (choice === 'View Blast Radius Details') {
-              vscode.commands.executeCommand('prSentinel.findingsView.focus');
+              await showBlastRadius();
             } else if (choice === 'View Changed Files Diff') {
               const parsed = parseAllChangedFiles(changedFiles);
               const doc = await vscode.workspace.openTextDocument({

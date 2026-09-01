@@ -20,7 +20,7 @@
         {
           "id": "pr-sentinel",
           "title": "PR Sentinel",
-          "icon": "$(shield)"
+          "icon": "media/shield.svg"
         }
       ]
     },
