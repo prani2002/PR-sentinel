@@ -49,6 +49,10 @@ export class GitHubClient {
       baseSha: data.base?.sha || '',
       headSha: data.head?.sha || '',
       htmlUrl: data.html_url,
+      branchName: data.head?.ref,
+      baseBranch: data.base?.ref,
+      author: data.user?.login,
+      updatedAt: data.updated_at,
     };
   }
 

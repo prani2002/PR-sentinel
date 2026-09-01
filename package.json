@@ -15,10 +15,33 @@
   "activationEvents": [],
   "main": "./dist/extension.cjs",
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "pr-sentinel",
+          "title": "PR Sentinel",
+          "icon": "$(shield)"
+        }
+      ]
+    },
+    "views": {
+      "pr-sentinel": [
+        {
+          "type": "webview",
+          "id": "prSentinel.findingsView",
+          "name": "PR Sentinel Findings"
+        }
+      ]
+    },
     "commands": [
       {
         "command": "pr-sentinel.analyzePR",
         "title": "PR Sentinel: Analyze Current PR",
+        "category": "PR Sentinel"
+      },
+      {
+        "command": "pr-sentinel.showFindings",
+        "title": "PR Sentinel: Show Blast Radius Findings",
         "category": "PR Sentinel"
       }
     ]

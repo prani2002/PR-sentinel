@@ -1,5 +1,5 @@
 /**
- * PR Sentinel - Core Data Models (Sprint 1)
+ * PR Sentinel - Core Data Models
  */
 
 export interface PullRequestInfo {
@@ -10,6 +10,10 @@ export interface PullRequestInfo {
   baseSha: string;
   headSha: string;
   htmlUrl?: string;
+  branchName?: string;
+  baseBranch?: string;
+  author?: string;
+  updatedAt?: string;
 }
 
 export interface ChangedFile {
@@ -38,41 +42,75 @@ export interface ParsedPatch {
   deletedLines: { line: number; text: string }[];
 }
 
-export interface SymbolInfo {
+export type SymbolKind =
+  | 'type-alias'
+  | 'interface'
+  | 'enum'
+  | 'function'
+  | 'class'
+  | 'variable'
+  | 'property';
+
+export interface ChangedSymbol {
   name: string;
-  kind: string;
+  kind: SymbolKind;
   filePath: string;
   startLine: number;
   endLine: number;
+  oldSnippet?: string;
+  newSnippet?: string;
+  removedMembers?: string[];
+  addedMembers?: string[];
 }
 
-export interface ReferenceInfo {
-  sourceFile: string;
-  targetSymbol: string;
+export interface ConsumerReference {
+  consumerFilePath: string;
+  targetSymbolName: string;
   line: number;
+  column: number;
+  snippet: string;
+  surroundingContext?: string;
+  checksValue?: string; // e.g. checked === 'success'
 }
 
-export interface Evidence {
+export interface BlastRadiusNode {
+  symbol: ChangedSymbol;
+  consumers: ConsumerReference[];
+}
+
+export interface EvidenceItem {
   file: string;
-  line?: number;
+  line: number;
   description: string;
-  snippet?: string;
+  snippet: string;
+  severity: 'high' | 'medium' | 'low';
 }
 
 export interface Finding {
-  severity: 'low' | 'medium' | 'high';
-  category: string;
+  id: string;
+  severity: 'high' | 'medium' | 'low';
+  category: 'breaking-change' | 'warning' | 'info';
   title: string;
+  filePath: string;
+  line?: number;
+  oldValue?: string;
+  newValue?: string;
+  affectedConsumersCount: number;
+  evidence: EvidenceItem[];
   explanation: string;
   recommendation: string;
   confidence: number;
-  evidence: Evidence[];
 }
 
-export interface GeminiAnalysisResult {
-  severity: 'low' | 'medium' | 'high';
-  category: 'frontend-breaking-change' | 'no-breaking-change' | 'uncertain';
-  confidence: number;
-  explanation: string;
-  recommendation: string;
+export interface AnalysisPipelineResult {
+  pr: PullRequestInfo;
+  changedFiles: ChangedFile[];
+  changedSymbols: ChangedSymbol[];
+  blastRadius: BlastRadiusNode[];
+  findings: Finding[];
+  metrics: {
+    breakingCount: number;
+    warningCount: number;
+    passedCount: number;
+  };
 }
