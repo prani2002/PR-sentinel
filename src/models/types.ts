@@ -3,6 +3,9 @@
  */
 
 export interface PullRequestInfo {
+  provider?: 'github' | 'gitlab';
+  typeLabel?: 'PR' | 'MR';
+  projectPath?: string;
   owner: string;
   repository: string;
   number: number;

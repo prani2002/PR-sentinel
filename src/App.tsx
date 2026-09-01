@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import {
   Shield,
   CheckCircle2,
@@ -22,15 +22,29 @@ import {
   Code2,
   AlertTriangle,
   FileDiff,
-  Github,
-  DownloadCloud
+  DownloadCloud,
+  Globe,
+  Key,
+  ShieldCheck,
+  Lock,
+  Unlock,
+  UserCheck,
+  Check
 } from 'lucide-react';
 
 import { REAL_PR_SCENARIOS, PRScenario } from './data/mockScenarios';
 import { DeterministicPipeline } from './pipeline/deterministicPipeline';
-import { GitHubClient, parseGitHubInput } from './github/githubClient';
+import {
+  parseGitUrlOrInput,
+  fetchRemotePullOrMergeRequest,
+  validateRemoteToken,
+  GitProviderType,
+  ParsedGitTarget,
+  UniversalTokenValidationResult
+} from './git/gitProvider';
 import { Finding, ConsumerReference, PullRequestInfo, ChangedFile } from './models/types';
 import { ProjectFileSource } from './analyzer/projectScanner';
+import { GitHubIcon, GitLabIcon } from './ui/GitIcons';
 
 export default function App() {
   const [selectedScenarioIndex, setSelectedScenarioIndex] = useState<number>(0);
@@ -42,16 +56,44 @@ export default function App() {
   const [showFetchModal, setShowFetchModal] = useState<boolean>(false);
   const [isReanalyzing, setIsReanalyzing] = useState<boolean>(false);
 
-  // Live GitHub fetch states
-  const [githubRepoInput, setGithubRepoInput] = useState<string>('facebook/react');
-  const [githubPrNumberInput, setGithubPrNumberInput] = useState<string>('28000');
-  const [githubTokenInput, setGithubTokenInput] = useState<string>('');
-  const [isFetchingGithub, setIsFetchingGithub] = useState<boolean>(false);
+  // Live Git Provider fetch & token states
+  const [providerMode, setProviderMode] = useState<'auto' | 'github' | 'gitlab'>('auto');
+  const [gitRepoInput, setGitRepoInput] = useState<string>('facebook/react');
+  const [gitNumberInput, setGitNumberInput] = useState<string>('28000');
+  const [gitTokenInput, setGitTokenInput] = useState<string>('');
+  const [isFetchingRemote, setIsFetchingRemote] = useState<boolean>(false);
+  const [isValidatingToken, setIsValidatingToken] = useState<boolean>(false);
+  const [tokenValidation, setTokenValidation] = useState<UniversalTokenValidationResult | null>(null);
   const [fetchError, setFetchError] = useState<string | null>(null);
+  const [showTokenHelp, setShowTokenHelp] = useState<boolean>(false);
+
+  // Load saved token from localStorage on initial render
+  useEffect(() => {
+    try {
+      const savedGhToken = localStorage.getItem('pr_sentinel_pat_github');
+      const savedGlToken = localStorage.getItem('pr_sentinel_pat_gitlab');
+      if (savedGhToken) {
+        setGitTokenInput(savedGhToken);
+      } else if (savedGlToken) {
+        setGitTokenInput(savedGlToken);
+      }
+    } catch {
+      // localStorage may be disabled in some sandboxes
+    }
+  }, []);
 
   const scenario: PRScenario = customScenario || REAL_PR_SCENARIOS[selectedScenarioIndex];
 
-  // Run the real deterministic AST analysis pipeline dynamically on current PR scenario
+  // Dynamically analyze current input to detect target and provider
+  const detectedTarget: { target?: ParsedGitTarget; error?: string } = useMemo(() => {
+    return parseGitUrlOrInput(
+      gitRepoInput,
+      gitNumberInput,
+      providerMode === 'auto' ? undefined : providerMode
+    );
+  }, [gitRepoInput, gitNumberInput, providerMode]);
+
+  // Run the real deterministic AST analysis pipeline dynamically on current PR/MR scenario
   const pipeline = useMemo(() => new DeterministicPipeline(), []);
   const analysisResult = useMemo(() => {
     return pipeline.run(
@@ -85,37 +127,79 @@ export default function App() {
     setActiveTab('consumer');
   };
 
-  // Handler to fetch live GitHub PR
-  const handleFetchLiveGitHubPR = async () => {
-    const parsed = parseGitHubInput(githubRepoInput, githubPrNumberInput);
+  // Validate personal access token against GitHub/GitLab
+  const handleValidateToken = async (explicitToken?: string): Promise<boolean> => {
+    const token = (explicitToken !== undefined ? explicitToken : gitTokenInput).trim();
+    if (!token) {
+      setTokenValidation({
+        valid: false,
+        provider: detectedTarget.target?.provider || 'github',
+        error: 'Please enter a Personal Access Token.',
+      });
+      return false;
+    }
+
+    const provider = detectedTarget.target?.provider || (providerMode === 'gitlab' ? 'gitlab' : 'github');
+    const host = detectedTarget.target?.host;
+
+    setIsValidatingToken(true);
+    try {
+      const res = await validateRemoteToken(provider, token, host);
+      setTokenValidation(res);
+      if (res.valid) {
+        try {
+          localStorage.setItem(`pr_sentinel_pat_${provider}`, token);
+        } catch {}
+      }
+      return res.valid;
+    } catch (err: any) {
+      setTokenValidation({
+        valid: false,
+        provider,
+        error: err.message || 'Token validation failed.',
+      });
+      return false;
+    } finally {
+      setIsValidatingToken(false);
+    }
+  };
+
+  // Handler to fetch live PR/MR from GitHub or GitLab and immediately review
+  const handleFetchRemotePrOrMr = async () => {
+    const parsed = detectedTarget;
     if (parsed.error || !parsed.target) {
-      setFetchError(parsed.error || 'Please enter a valid GitHub repository or PR URL.');
+      setFetchError(parsed.error || 'Please enter a valid GitHub or GitLab URL or repository path.');
       return;
     }
 
-    const { owner, repo, prNumber } = parsed.target;
-    if (!prNumber || prNumber <= 0) {
-      setFetchError('Please enter a valid positive Pull Request number (e.g. 28000).');
+    const target = parsed.target;
+    if (!target.number || target.number <= 0) {
+      setFetchError(`Please enter a valid positive ${target.typeLabel} number.`);
       return;
     }
 
-    setIsFetchingGithub(true);
+    setIsFetchingRemote(true);
     setFetchError(null);
 
+    // If token provided, validate in background if not already valid
+    if (gitTokenInput && (!tokenValidation || !tokenValidation.valid)) {
+      await handleValidateToken(gitTokenInput);
+    }
+
     try {
-      const client = new GitHubClient(githubTokenInput || undefined);
-      const prInfo: PullRequestInfo = await client.getPullRequest(owner, repo, prNumber);
-      const changedFiles: ChangedFile[] = await client.getPullRequestFiles(owner, repo, prNumber);
+      const { prInfo, changedFiles } = await fetchRemotePullOrMergeRequest(
+        target,
+        gitTokenInput || undefined
+      );
 
       if (!changedFiles || changedFiles.length === 0) {
-        setFetchError(`PR #${prNumber} on ${owner}/${repo} returned no changed files.`);
-        setIsFetchingGithub(false);
+        setFetchError(`${target.typeLabel} #${target.number} returned no changed files or diffs.`);
+        setIsFetchingRemote(false);
         return;
       }
 
       // Build workspace file representations from patch data
       const workspaceFiles: ProjectFileSource[] = changedFiles.map((f) => {
-        // Extract added lines from patch as simulated source content if not locally available
         const lines = f.patch
           ? f.patch
               .split('\n')
@@ -130,7 +214,7 @@ export default function App() {
       });
 
       const newScenario: PRScenario = {
-        id: `github-${owner}-${repo}-${prNumber}`,
+        id: `${target.provider}-${target.owner}-${target.repo}-${target.number}`,
         pr: prInfo,
         changedFiles,
         workspaceFiles,
@@ -143,10 +227,10 @@ export default function App() {
         setSelectedConsumerFile(changedFiles[0].filename);
       }
     } catch (err: any) {
-      console.error('Failed to fetch GitHub PR:', err);
-      setFetchError(err.message || 'Error communicating with GitHub API. Rate limit or invalid PR.');
+      console.error('Failed to fetch remote Git PR/MR:', err);
+      setFetchError(err.message || 'Error communicating with Git Provider API. Rate limit or permissions.');
     } finally {
-      setIsFetchingGithub(false);
+      setIsFetchingRemote(false);
     }
   };
 
@@ -167,6 +251,9 @@ export default function App() {
     patch: '',
   };
 
+  const currentProvider = scenario.pr.provider || (scenario.id.includes('gitlab') ? 'gitlab' : 'github');
+  const currentTypeLabel = scenario.pr.typeLabel || (currentProvider === 'gitlab' ? 'MR' : 'PR');
+
   return (
     <div className="h-screen w-screen flex flex-col bg-[#141416] text-[#cccccc] font-sans overflow-hidden select-none">
       {/* VS Code Title Bar */}
@@ -177,14 +264,29 @@ export default function App() {
             <div className="w-3 h-3 rounded-full bg-[#eab308] opacity-85 hover:opacity-100 transition cursor-pointer" />
             <div className="w-3 h-3 rounded-full bg-[#22c55e] opacity-85 hover:opacity-100 transition cursor-pointer" />
           </div>
-          <span className="text-[#a1a1aa] text-[12px] font-mono tracking-wide">
-            {scenario.pr.owner}/{scenario.pr.repository} (PR #{scenario.pr.number})
-          </span>
+
+          <div className="flex items-center gap-1.5 text-[#a1a1aa] text-[12px] font-mono tracking-wide">
+            {currentProvider === 'gitlab' ? (
+              <span className="flex items-center gap-1 text-[#fc6d26] font-semibold">
+                <GitLabIcon className="w-3.5 h-3.5" />
+                <span>GitLab</span>
+              </span>
+            ) : (
+              <span className="flex items-center gap-1 text-white font-semibold">
+                <GitHubIcon className="w-3.5 h-3.5" />
+                <span>GitHub</span>
+              </span>
+            )}
+            <span className="text-[#52525b]">•</span>
+            <span>
+              {scenario.pr.projectPath || `${scenario.pr.owner}/${scenario.pr.repository}`} ({currentTypeLabel} #{scenario.pr.number})
+            </span>
+          </div>
         </div>
 
-        {/* PR Switcher Dropdown & Live GitHub Fetch Button */}
-        <div className="flex-1 max-w-lg mx-4 flex justify-center items-center gap-2">
-          <span className="text-[11px] text-[#71717a]">PR:</span>
+        {/* PR Switcher Dropdown & Live Fetch Button */}
+        <div className="flex-1 max-w-xl mx-4 flex justify-center items-center gap-2">
+          <span className="text-[11px] text-[#71717a]">Target:</span>
           <select
             value={customScenario ? 'custom' : selectedScenarioIndex}
             onChange={(e) => {
@@ -193,28 +295,52 @@ export default function App() {
               setSelectedScenarioIndex(Number(e.target.value));
               setSelectedFindingId(null);
             }}
-            className="bg-[#202024] text-xs text-[#e4e4e7] border border-[#2e2e34] rounded px-2.5 py-1 outline-none focus:border-[#38bdf8] max-w-[260px] truncate"
+            className="bg-[#202024] text-xs text-[#e4e4e7] border border-[#2e2e34] rounded px-2.5 py-1 outline-none focus:border-[#38bdf8] max-w-[280px] truncate"
           >
             {customScenario && (
               <option value="custom">
-                [Live GitHub] {customScenario.pr.owner}/{customScenario.pr.repository} #{customScenario.pr.number}
+                [{customScenario.pr.provider === 'gitlab' ? 'GitLab MR' : 'GitHub PR'}] {customScenario.pr.owner}/{customScenario.pr.repository} #{customScenario.pr.number}
               </option>
             )}
-            {REAL_PR_SCENARIOS.map((sc, idx) => (
-              <option key={sc.id} value={idx}>
-                PR #{sc.pr.number}: {sc.pr.title.slice(0, 35)}...
-              </option>
-            ))}
+            {REAL_PR_SCENARIOS.map((sc, idx) => {
+              const p = sc.pr.provider || (sc.id.includes('gitlab') ? 'gitlab' : 'github');
+              const t = sc.pr.typeLabel || (p === 'gitlab' ? 'MR' : 'PR');
+              return (
+                <option key={sc.id} value={idx}>
+                  [{p === 'gitlab' ? 'GitLab' : 'GitHub'} {t} #{sc.pr.number}] {sc.pr.title.slice(0, 32)}...
+                </option>
+              );
+            })}
           </select>
 
           <button
             onClick={() => setShowFetchModal(true)}
             className="flex items-center gap-1.5 px-2.5 py-1 rounded bg-[#0284c7]/20 hover:bg-[#0284c7]/30 text-[#38bdf8] border border-[#0284c7]/40 text-xs font-medium transition cursor-pointer"
-            title="Fetch any live PR from GitHub"
+            title="Fetch any live PR or MR from GitHub or GitLab"
           >
-            <Github className="w-3.5 h-3.5" />
-            <span>Fetch from GitHub</span>
+            <DownloadCloud className="w-3.5 h-3.5" />
+            <span>Fetch from GitHub / GitLab</span>
           </button>
+
+          {tokenValidation?.valid ? (
+            <button
+              onClick={() => setShowFetchModal(true)}
+              className="flex items-center gap-1 px-2 py-0.5 rounded bg-[#166534]/40 hover:bg-[#166534]/60 text-[#86efac] border border-[#22c55e]/40 text-[11px] font-medium transition cursor-pointer"
+              title={`Authenticated via PAT: ${tokenValidation.username ? '@' + tokenValidation.username : 'Active'}`}
+            >
+              <ShieldCheck className="w-3 h-3 text-[#22c55e]" />
+              <span>PAT: {tokenValidation.username ? `@${tokenValidation.username}` : 'Active'}</span>
+            </button>
+          ) : gitTokenInput ? (
+            <button
+              onClick={() => setShowFetchModal(true)}
+              className="flex items-center gap-1 px-2 py-0.5 rounded bg-[#854d0e]/30 hover:bg-[#854d0e]/50 text-[#fde047] border border-[#ca8a04]/40 text-[11px] font-medium transition cursor-pointer"
+              title="PAT entered - click to validate"
+            >
+              <Key className="w-3 h-3 text-[#eab308]" />
+              <span>PAT (Unverified)</span>
+            </button>
+          ) : null}
         </div>
 
         <div className="flex items-center space-x-3 text-[#a1a1aa]">
@@ -274,7 +400,17 @@ export default function App() {
             {/* PR Info Header */}
             <div className="space-y-1">
               <div className="flex items-center space-x-2">
-                <span className="text-sm font-bold text-white">PR #{scenario.pr.number}</span>
+                {currentProvider === 'gitlab' ? (
+                  <span className="flex items-center gap-1 text-[11px] font-bold text-[#fc6d26] bg-[#fc6d26]/10 border border-[#fc6d26]/30 px-1.5 py-0.5 rounded">
+                    <GitLabIcon className="w-3 h-3" />
+                    GitLab MR !{scenario.pr.number}
+                  </span>
+                ) : (
+                  <span className="flex items-center gap-1 text-[11px] font-bold text-white bg-[#27272a] border border-[#3f3f46] px-1.5 py-0.5 rounded">
+                    <GitHubIcon className="w-3 h-3" />
+                    GitHub PR #{scenario.pr.number}
+                  </span>
+                )}
                 <span className="text-[10px] font-semibold bg-[#14532d] text-[#86efac] border border-[#22c55e]/40 px-1.5 py-0.2 rounded">
                   Open
                 </span>
@@ -284,7 +420,7 @@ export default function App() {
                     target="_blank"
                     rel="noreferrer"
                     className="text-[#38bdf8] hover:text-[#7dd3fc]"
-                    title="Open on GitHub"
+                    title={`Open on ${currentProvider === 'gitlab' ? 'GitLab' : 'GitHub'}`}
                   >
                     <ExternalLink className="w-3.5 h-3.5" />
                   </a>
@@ -294,9 +430,9 @@ export default function App() {
                 {scenario.pr.title}
               </div>
               <div className="text-[11px] text-[#71717a] font-mono flex items-center gap-1">
-                <span className="truncate">{scenario.pr.branchName || 'head'}</span>
+                <span className="truncate">{scenario.pr.branchName || 'feature'}</span>
                 <span>→</span>
-                <span>{scenario.pr.baseBranch || 'base'}</span>
+                <span>{scenario.pr.baseBranch || 'main'}</span>
               </div>
             </div>
 
@@ -744,53 +880,114 @@ export default function App() {
         </aside>
       </div>
 
-      {/* Live GitHub PR Fetch Modal */}
+      {/* Live Git Provider PR/MR Fetch Modal */}
       {showFetchModal && (
         <div className="fixed inset-0 bg-black/70 backdrop-blur-xs flex items-center justify-center z-50 p-4">
-          <div className="w-full max-w-md bg-[#18181b] border border-[#27272a] rounded-lg shadow-2xl p-5 space-y-4">
+          <div className="w-full max-w-lg bg-[#18181b] border border-[#27272a] rounded-lg shadow-2xl p-5 space-y-4">
             <div className="flex items-center justify-between border-b border-[#27272a] pb-3">
               <div className="flex items-center space-x-2">
-                <Github className="w-4 h-4 text-[#38bdf8]" />
-                <h3 className="text-sm font-bold text-white">Fetch Live GitHub Pull Request</h3>
+                <DownloadCloud className="w-4 h-4 text-[#38bdf8]" />
+                <h3 className="text-sm font-bold text-white">Fetch Live GitHub PR or GitLab MR</h3>
               </div>
               <button onClick={() => setShowFetchModal(false)} className="text-[#71717a] hover:text-white">
                 <X className="w-4 h-4" />
               </button>
             </div>
 
+            {/* Provider Selector Tabs */}
+            <div className="flex items-center gap-2 p-1 bg-[#141416] border border-[#27272a] rounded">
+              <button
+                type="button"
+                onClick={() => setProviderMode('auto')}
+                className={`flex-1 py-1.5 px-2 rounded text-xs font-medium flex items-center justify-center gap-1.5 transition cursor-pointer ${
+                  providerMode === 'auto'
+                    ? 'bg-[#27272a] text-white shadow-xs'
+                    : 'text-[#71717a] hover:text-[#d4d4d8]'
+                }`}
+              >
+                <Globe className="w-3.5 h-3.5 text-[#38bdf8]" />
+                <span>Auto Detect URL</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setProviderMode('github')}
+                className={`flex-1 py-1.5 px-2 rounded text-xs font-medium flex items-center justify-center gap-1.5 transition cursor-pointer ${
+                  providerMode === 'github'
+                    ? 'bg-[#27272a] text-white shadow-xs'
+                    : 'text-[#71717a] hover:text-[#d4d4d8]'
+                }`}
+              >
+                <GitHubIcon className="w-3.5 h-3.5" />
+                <span>GitHub (PR)</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setProviderMode('gitlab')}
+                className={`flex-1 py-1.5 px-2 rounded text-xs font-medium flex items-center justify-center gap-1.5 transition cursor-pointer ${
+                  providerMode === 'gitlab'
+                    ? 'bg-[#27272a] text-white shadow-xs'
+                    : 'text-[#71717a] hover:text-[#d4d4d8]'
+                }`}
+              >
+                <GitLabIcon className="w-3.5 h-3.5" />
+                <span>GitLab (MR)</span>
+              </button>
+            </div>
+
             <div className="space-y-3 text-xs text-[#d4d4d8]">
               <div>
-                <label className="block text-[11px] font-semibold text-[#a1a1aa] mb-1">
-                  GitHub Repository or PR URL
-                </label>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="block text-[11px] font-semibold text-[#a1a1aa]">
+                    {detectedTarget.target?.provider === 'gitlab'
+                      ? 'GitLab Project Path or MR URL'
+                      : 'GitHub Repository or PR URL'}
+                  </label>
+                  {detectedTarget.target && (
+                    <span className="flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider text-[#38bdf8]">
+                      {detectedTarget.target.provider === 'gitlab' ? (
+                        <>
+                          <GitLabIcon className="w-3 h-3" />
+                          <span>Detected: GitLab ({detectedTarget.target.host || 'gitlab.com'})</span>
+                        </>
+                      ) : (
+                        <>
+                          <GitHubIcon className="w-3 h-3" />
+                          <span>Detected: GitHub (api.github.com)</span>
+                        </>
+                      )}
+                    </span>
+                  )}
+                </div>
                 <input
                   type="text"
-                  value={githubRepoInput}
+                  value={gitRepoInput}
                   onChange={(e) => {
                     const val = e.target.value;
-                    setGithubRepoInput(val);
+                    setGitRepoInput(val);
                     setFetchError(null);
-                    const parsed = parseGitHubInput(val);
-                    if (parsed.target) {
-                      if (parsed.target.prNumber) {
-                        setGithubPrNumberInput(parsed.target.prNumber.toString());
-                      }
+                    const parsed = parseGitUrlOrInput(
+                      val,
+                      gitNumberInput,
+                      providerMode === 'auto' ? undefined : providerMode
+                    );
+                    if (parsed.target?.number) {
+                      setGitNumberInput(parsed.target.number.toString());
                     }
                   }}
-                  placeholder="e.g. facebook/react or https://github.com/facebook/react/pull/28000"
+                  placeholder="e.g. facebook/react/pull/28000 or gitlab-org/gitlab/-/merge_requests/120000"
                   className="w-full bg-[#141416] border border-[#27272a] rounded px-3 py-2 text-xs text-white focus:border-[#38bdf8] outline-none font-mono placeholder:font-sans"
                 />
               </div>
 
               <div>
                 <label className="block text-[11px] font-semibold text-[#a1a1aa] mb-1">
-                  Pull Request Number
+                  {detectedTarget.target?.typeLabel === 'MR' ? 'Merge Request (MR) IID' : 'Pull Request (PR) Number'}
                 </label>
                 <input
                   type="number"
-                  value={githubPrNumberInput}
+                  value={gitNumberInput}
                   onChange={(e) => {
-                    setGithubPrNumberInput(e.target.value);
+                    setGitNumberInput(e.target.value);
                     setFetchError(null);
                   }}
                   placeholder="e.g. 28000"
@@ -798,68 +995,234 @@ export default function App() {
                 />
               </div>
 
-              {/* Quick Preset Buttons */}
+              {/* Quick Preset Buttons for BOTH GitHub and GitLab */}
               <div>
                 <span className="block text-[10px] uppercase font-bold tracking-wider text-[#71717a] mb-1.5">
                   Try Live Examples:
                 </span>
-                <div className="flex flex-wrap gap-1.5">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setGithubRepoInput('facebook/react');
-                      setGithubPrNumberInput('28000');
-                      setFetchError(null);
-                    }}
-                    className="px-2 py-1 rounded bg-[#202024] hover:bg-[#27272a] text-[#38bdf8] border border-[#2e2e34] text-[11px] font-mono transition"
-                  >
-                    facebook/react #28000
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setGithubRepoInput('reduxjs/redux');
-                      setGithubPrNumberInput('4500');
-                      setFetchError(null);
-                    }}
-                    className="px-2 py-1 rounded bg-[#202024] hover:bg-[#27272a] text-[#38bdf8] border border-[#2e2e34] text-[11px] font-mono transition"
-                  >
-                    reduxjs/redux #4500
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setGithubRepoInput('microsoft/TypeScript');
-                      setGithubPrNumberInput('57000');
-                      setFetchError(null);
-                    }}
-                    className="px-2 py-1 rounded bg-[#202024] hover:bg-[#27272a] text-[#38bdf8] border border-[#2e2e34] text-[11px] font-mono transition"
-                  >
-                    microsoft/TypeScript #57000
-                  </button>
+                <div className="space-y-1.5">
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <span className="text-[10px] text-[#a1a1aa] w-14 font-semibold flex items-center gap-1">
+                      <GitHubIcon className="w-3 h-3" /> GitHub:
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setProviderMode('github');
+                        setGitRepoInput('facebook/react');
+                        setGitNumberInput('28000');
+                        setFetchError(null);
+                      }}
+                      className="px-2 py-0.5 rounded bg-[#202024] hover:bg-[#27272a] text-[#38bdf8] border border-[#2e2e34] text-[11px] font-mono transition"
+                    >
+                      facebook/react #28000
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setProviderMode('github');
+                        setGitRepoInput('reduxjs/redux');
+                        setGitNumberInput('4500');
+                        setFetchError(null);
+                      }}
+                      className="px-2 py-0.5 rounded bg-[#202024] hover:bg-[#27272a] text-[#38bdf8] border border-[#2e2e34] text-[11px] font-mono transition"
+                    >
+                      reduxjs/redux #4500
+                    </button>
+                  </div>
+
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <span className="text-[10px] text-[#a1a1aa] w-14 font-semibold flex items-center gap-1">
+                      <GitLabIcon className="w-3 h-3" /> GitLab:
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setProviderMode('gitlab');
+                        setGitRepoInput('gitlab-org/gitlab');
+                        setGitNumberInput('120000');
+                        setFetchError(null);
+                      }}
+                      className="px-2 py-0.5 rounded bg-[#202024] hover:bg-[#27272a] text-[#fc6d26] border border-[#2e2e34] text-[11px] font-mono transition"
+                    >
+                      gitlab-org/gitlab !120000
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setProviderMode('gitlab');
+                        setGitRepoInput('gitlab-org/gitlab-runner');
+                        setGitNumberInput('4500');
+                        setFetchError(null);
+                      }}
+                      className="px-2 py-0.5 rounded bg-[#202024] hover:bg-[#27272a] text-[#fc6d26] border border-[#2e2e34] text-[11px] font-mono transition"
+                    >
+                      gitlab-org/gitlab-runner !4500
+                    </button>
+                  </div>
                 </div>
               </div>
 
-              <div>
-                <label className="block text-[11px] font-semibold text-[#a1a1aa] mb-1">
-                  GitHub Personal Access Token <span className="text-[#71717a] font-normal">(Optional for public repos)</span>
-                </label>
-                <input
-                  type="password"
-                  value={githubTokenInput}
-                  onChange={(e) => setGithubTokenInput(e.target.value)}
-                  placeholder="ghp_... (increases rate limit to 5,000 req/hr)"
-                  className="w-full bg-[#141416] border border-[#27272a] rounded px-3 py-2 text-xs text-white focus:border-[#38bdf8] outline-none font-mono placeholder:font-sans"
-                />
+              {/* Personal Access Token (PAT) Section */}
+              <div className="pt-2 border-t border-[#27272a]/70 space-y-2">
+                <div className="flex items-center justify-between">
+                  <label className="flex items-center gap-1.5 text-[11px] font-semibold text-[#a1a1aa]">
+                    <Key className="w-3.5 h-3.5 text-[#eab308]" />
+                    <span>Personal Access Token (PAT)</span>
+                    <span className="text-[#71717a] font-normal text-[10px]">(Required for private repos)</span>
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => setShowTokenHelp(!showTokenHelp)}
+                    className="text-[11px] text-[#38bdf8] hover:underline flex items-center gap-1 cursor-pointer"
+                  >
+                    <HelpCircle className="w-3 h-3" />
+                    <span>{showTokenHelp ? 'Hide instructions' : 'How to create PAT?'}</span>
+                  </button>
+                </div>
+
+                {/* Token Input with Validate Button */}
+                <div className="flex items-center gap-2">
+                  <div className="relative flex-1">
+                    <input
+                      type="password"
+                      value={gitTokenInput}
+                      onChange={(e) => {
+                        setGitTokenInput(e.target.value);
+                        setTokenValidation(null);
+                        setFetchError(null);
+                      }}
+                      placeholder={
+                        detectedTarget.target?.provider === 'gitlab'
+                          ? 'glpat-... (GitLab Personal Access Token)'
+                          : 'ghp_... (GitHub Personal Access Token)'
+                      }
+                      className="w-full bg-[#141416] border border-[#27272a] rounded px-3 py-2 text-xs text-white focus:border-[#38bdf8] outline-none font-mono placeholder:font-sans pr-8"
+                    />
+                    {gitTokenInput && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setGitTokenInput('');
+                          setTokenValidation(null);
+                          try {
+                            localStorage.removeItem('pr_sentinel_pat_github');
+                            localStorage.removeItem('pr_sentinel_pat_gitlab');
+                          } catch {}
+                        }}
+                        className="absolute right-2 top-2.5 text-[#71717a] hover:text-white text-xs cursor-pointer"
+                        title="Clear token"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => handleValidateToken()}
+                    disabled={isValidatingToken || !gitTokenInput.trim()}
+                    className="px-3 py-2 bg-[#27272a] hover:bg-[#323238] disabled:opacity-40 text-xs text-[#e4e4e7] font-medium rounded border border-[#3f3f46] flex items-center gap-1.5 transition cursor-pointer shrink-0"
+                  >
+                    {isValidatingToken ? (
+                      <>
+                        <RefreshCw className="w-3 h-3 animate-spin text-[#38bdf8]" />
+                        <span>Validating...</span>
+                      </>
+                    ) : (
+                      <>
+                        <ShieldCheck className="w-3.5 h-3.5 text-[#22c55e]" />
+                        <span>Validate Token</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+
+                {/* Token Validation Feedback */}
+                {tokenValidation && (
+                  <div
+                    className={`p-2.5 rounded border text-xs leading-relaxed transition ${
+                      tokenValidation.valid
+                        ? 'bg-[#052e16]/60 border-[#166534] text-[#86efac]'
+                        : 'bg-[#450a0a]/60 border-[#991b1b] text-[#fca5a5]'
+                    }`}
+                  >
+                    {tokenValidation.valid ? (
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="space-y-1">
+                          <div className="flex items-center gap-1.5 font-semibold text-[#4ade80]">
+                            <CheckCircle className="w-3.5 h-3.5 text-[#22c55e] shrink-0" />
+                            <span>PAT Validated &amp; Active</span>
+                            {tokenValidation.username && (
+                              <span className="text-white font-mono font-normal">
+                                (@{tokenValidation.username})
+                              </span>
+                            )}
+                          </div>
+                          <div className="text-[11px] text-[#bbf7d0] flex items-center gap-2 flex-wrap">
+                            {tokenValidation.scopes && tokenValidation.scopes.length > 0 && (
+                              <span>Scopes: {tokenValidation.scopes.join(', ')}</span>
+                            )}
+                            {tokenValidation.rateLimit && (
+                              <span className="text-[#86efac]/80">
+                                • API Rate Limit: {tokenValidation.rateLimit.remaining} / {tokenValidation.rateLimit.limit} req/hr
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                        <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-[#16a34a]/30 text-[#4ade80] uppercase tracking-wider shrink-0">
+                          Ready
+                        </span>
+                      </div>
+                    ) : (
+                      <div className="flex items-start gap-2">
+                        <XCircle className="w-3.5 h-3.5 text-[#ef4444] shrink-0 mt-0.5" />
+                        <div>
+                          <div className="font-semibold text-red-200">Validation Failed</div>
+                          <div className="text-[11px] text-red-300">{tokenValidation.error}</div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Token Help Guide */}
+                {showTokenHelp && (
+                  <div className="p-3 bg-[#202024] border border-[#2e2e34] rounded text-[11px] text-[#a1a1aa] space-y-2">
+                    <div className="font-bold text-white flex items-center gap-1.5">
+                      <Lock className="w-3.5 h-3.5 text-[#eab308]" />
+                      <span>Accessing Private Repositories</span>
+                    </div>
+                    {detectedTarget.target?.provider === 'gitlab' ? (
+                      <div className="space-y-1 text-[#d4d4d8] leading-relaxed">
+                        <p>1. In GitLab, navigate to <strong>User Settings &gt; Access Tokens</strong>.</p>
+                        <p>2. Create a token with <strong>read_api</strong> and <strong>read_repository</strong> scopes.</p>
+                        <p>3. Paste the token above and click <strong>Validate Token</strong>.</p>
+                      </div>
+                    ) : (
+                      <div className="space-y-1 text-[#d4d4d8] leading-relaxed">
+                        <p>1. In GitHub, go to <strong>Settings &gt; Developer settings &gt; Personal access tokens &gt; Tokens (classic)</strong>.</p>
+                        <p>2. Generate a token selecting the <strong>repo</strong> (Full control of private repositories) scope.</p>
+                        <p>3. Paste the token above and click <strong>Validate Token</strong>.</p>
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
 
               {fetchError && (
-                <div className="p-3 rounded bg-red-950/70 border border-red-800/80 text-red-300 text-xs leading-relaxed space-y-1">
+                <div className="p-3 rounded bg-red-950/70 border border-red-800/80 text-red-300 text-xs leading-relaxed space-y-2">
                   <div className="font-bold flex items-center gap-1.5 text-red-200">
                     <AlertTriangle className="w-3.5 h-3.5 text-red-400 shrink-0" />
-                    <span>Unable to fetch PR</span>
+                    <span>Unable to fetch {detectedTarget.target?.typeLabel || 'PR/MR'}</span>
                   </div>
                   <div>{fetchError}</div>
+                  {!gitTokenInput && (
+                    <div className="pt-1.5 border-t border-red-900/60 text-[11px] text-red-200 flex items-center gap-1.5">
+                      <Key className="w-3 h-3 text-[#eab308] shrink-0" />
+                      <span>If this repository is private, provide a Personal Access Token with repo read permission above and click Validate.</span>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -872,19 +1235,22 @@ export default function App() {
                 Cancel
               </button>
               <button
-                onClick={handleFetchLiveGitHubPR}
-                disabled={isFetchingGithub}
+                onClick={handleFetchRemotePrOrMr}
+                disabled={isFetchingRemote || isValidatingToken}
                 className="px-4 py-1.5 bg-[#0284c7] hover:bg-[#0369a1] text-white text-xs font-medium rounded flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
               >
-                {isFetchingGithub ? (
+                {isFetchingRemote ? (
                   <>
                     <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                    <span>Fetching API...</span>
+                    <span>Calling {detectedTarget.target?.provider === 'gitlab' ? 'GitLab v4' : 'GitHub v3'} API...</span>
                   </>
                 ) : (
                   <>
                     <DownloadCloud className="w-3.5 h-3.5" />
-                    <span>Fetch &amp; Analyze PR</span>
+                    <span>
+                      {tokenValidation?.valid ? 'Validate & Review ' : 'Fetch & Analyze '}
+                      {detectedTarget.target?.provider === 'gitlab' ? 'GitLab MR' : 'GitHub PR'}
+                    </span>
                   </>
                 )}
               </button>
@@ -910,7 +1276,7 @@ export default function App() {
             <div className="space-y-3 text-xs text-[#d4d4d8]">
               <p className="leading-relaxed">
                 Deterministic AST parsing identified that symbol{' '}
-                <code className="text-[#38bdf8] font-mono">{selectedFinding.title}</code> was altered in the PR diff:
+                <code className="text-[#38bdf8] font-mono">{selectedFinding.title}</code> was altered in the {currentTypeLabel} diff:
               </p>
 
               <div className="bg-[#141416] p-3 rounded font-mono text-[11px] space-y-2 border border-[#27272a]">
@@ -954,7 +1320,14 @@ export default function App() {
         </div>
 
         <div className="flex items-center space-x-4">
-          <span>AST Deterministic Engine</span>
+          <span className="flex items-center gap-1">
+            {currentProvider === 'gitlab' ? (
+              <GitLabIcon className="w-3 h-3" />
+            ) : (
+              <GitHubIcon className="w-3 h-3" />
+            )}
+            <span>{currentProvider === 'gitlab' ? 'GitLab REST v4' : 'GitHub REST v3'}</span>
+          </span>
           <span>Spaces: 2</span>
           <span>UTF-8</span>
           <span className="flex items-center gap-1">

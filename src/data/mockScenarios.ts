@@ -12,6 +12,8 @@ export const REAL_PR_SCENARIOS: PRScenario[] = [
   {
     id: 'pr-421',
     pr: {
+      provider: 'github',
+      typeLabel: 'PR',
       owner: 'acme-corp',
       repository: 'payment-gateway',
       number: 421,
@@ -98,8 +100,70 @@ describe('Payment Service', () => {
     ],
   },
   {
+    id: 'gitlab-mr-1042',
+    pr: {
+      provider: 'gitlab',
+      typeLabel: 'MR',
+      projectPath: 'gitlab-org/telemetry-engine',
+      owner: 'gitlab-org',
+      repository: 'telemetry-engine',
+      number: 1042,
+      title: 'Deprecate TrackEventType trackSession in favor of captureEvent',
+      baseSha: '67a89b',
+      headSha: '11c22d',
+      branchName: 'refactor/telemetry-events',
+      baseBranch: 'main',
+      author: 'alex_gitlab',
+      updatedAt: '2026-09-01T04:20:00Z',
+    },
+    changedFiles: [
+      {
+        filename: 'packages/telemetry/events.ts',
+        status: 'modified',
+        additions: 1,
+        deletions: 1,
+        changes: 2,
+        sha: 'fe8192a',
+        patch: `@@ -1,4 +1,4 @@
+ export type TrackEventType =
+-  | 'trackSession'
++  | 'captureEvent'
+   | 'pageView'
+   | 'errorLog';`,
+      },
+    ],
+    workspaceFiles: [
+      {
+        path: 'packages/telemetry/events.ts',
+        content: `export type TrackEventType =
+  | 'captureEvent'
+  | 'pageView'
+  | 'errorLog';
+
+export interface TelemetryPayload {
+  eventType: TrackEventType;
+  timestamp: number;
+}`,
+      },
+      {
+        path: 'apps/web/SessionTracker.tsx',
+        content: `import React from 'react';
+import { TelemetryPayload } from '../telemetry/events';
+
+export function SessionTracker({ payload }: { payload: TelemetryPayload }) {
+  if (payload.eventType === 'trackSession') {
+    return <div className="text-xs text-blue-400">Tracking Active Session</div>;
+  }
+  return <div className="text-xs text-zinc-400">Standard Event</div>;
+}`,
+      },
+    ],
+  },
+  {
     id: 'pr-512',
     pr: {
+      provider: 'github',
+      typeLabel: 'PR',
       owner: 'acme-corp',
       repository: 'payment-gateway',
       number: 512,

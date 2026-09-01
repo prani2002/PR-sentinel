@@ -6,6 +6,17 @@ export interface ParsedGitHubTarget {
   prNumber?: number;
 }
 
+export interface TokenValidationResult {
+  valid: boolean;
+  username?: string;
+  name?: string;
+  avatarUrl?: string;
+  scopes?: string[];
+  rateLimitRemaining?: number;
+  rateLimitLimit?: number;
+  error?: string;
+}
+
 /**
  * Robust parser supporting:
  * - https://github.com/facebook/react/pull/28000
@@ -13,6 +24,8 @@ export interface ParsedGitHubTarget {
  * - facebook/react/pull/28000
  * - https://github.com/facebook/react
  * - facebook/react
+ * - git@github.com:facebook/react.git
+ * - Single slash typos like https:/github.com/...
  */
 export function parseGitHubInput(
   input: string,
@@ -23,12 +36,15 @@ export function parseGitHubInput(
     return { error: 'Please enter a GitHub repository (e.g. facebook/react) or PR URL.' };
   }
 
-  // Remove protocol and domain prefixes if present
-  cleaned = cleaned.replace(/^https?:\/\//i, '');
+  // Robust protocol and prefix stripping (handles https://, http://, https:/, git@github.com:, etc.)
+  cleaned = cleaned.replace(/^git@github\.com:/i, '');
+  cleaned = cleaned.replace(/^https?:\/+/i, '');
+  cleaned = cleaned.replace(/^ssh:\/+/i, '');
   cleaned = cleaned.replace(/^www\./i, '');
   cleaned = cleaned.replace(/^github\.com\//i, '');
+  cleaned = cleaned.replace(/^api\.github\.com\/repos\//i, '');
 
-  // Strip query parameters and hashes
+  // Strip query parameters and anchor hashes
   cleaned = cleaned.split('?')[0];
 
   let extractedPr: number | undefined;
@@ -46,26 +62,41 @@ export function parseGitHubInput(
 
   const segments = cleaned.split('/').filter(Boolean);
 
+  // Filter out any segment that contains protocol artifacts or invalid characters
+  const validSegments = segments.filter((seg) => !seg.includes(':') && !seg.includes('@') && seg !== 'https' && seg !== 'http');
+
+  if (validSegments.length === 0) {
+    return {
+      error: 'Please enter a valid GitHub repository (e.g. owner/repo) or PR URL (e.g. https://github.com/owner/repo/pull/123).',
+    };
+  }
+
   let owner = '';
   let repo = '';
 
-  if (segments.length >= 2) {
-    owner = segments[0];
-    repo = segments[1].replace(/\.git$/i, '');
+  if (validSegments.length >= 2) {
+    owner = validSegments[0];
+    repo = validSegments[1].replace(/\.git$/i, '');
 
     // Check if URL has /pull/123 or /pulls/123
-    const pullIdx = segments.findIndex(
+    const pullIdx = validSegments.findIndex(
       (s) => s.toLowerCase() === 'pull' || s.toLowerCase() === 'pulls'
     );
-    if (pullIdx !== -1 && segments[pullIdx + 1]) {
-      const parsedNum = parseInt(segments[pullIdx + 1], 10);
+    if (pullIdx !== -1 && validSegments[pullIdx + 1]) {
+      const parsedNum = parseInt(validSegments[pullIdx + 1], 10);
       if (!isNaN(parsedNum) && parsedNum > 0) {
         extractedPr = parsedNum;
       }
     }
+  } else if (validSegments.length === 1) {
+    return {
+      error: `Incomplete repository name "${validSegments[0]}". Please provide both owner and repo (e.g. facebook/react).`,
+    };
   }
 
-  if (!owner || !repo || owner.includes(':') || repo.includes(':')) {
+  // Sanity check owner and repo
+  const validNameRegex = /^[a-zA-Z0-9_.-]+$/;
+  if (!owner || !repo || !validNameRegex.test(owner) || !validNameRegex.test(repo)) {
     return {
       error:
         'Invalid repository format. Please enter "owner/repo" (e.g. facebook/react) or a full PR URL (e.g. https://github.com/facebook/react/pull/28000).',
@@ -114,6 +145,67 @@ export class GitHubClient {
     return headers;
   }
 
+  /**
+   * Validates a GitHub Personal Access Token against the /user endpoint
+   */
+  public async validateToken(): Promise<TokenValidationResult> {
+    if (!this.token) {
+      return { valid: false, error: 'No Personal Access Token provided.' };
+    }
+
+    try {
+      const response = await fetch(`${this.baseUrl}/user`, {
+        method: 'GET',
+        headers: this.getHeaders(),
+      });
+
+      const scopesHeader = response.headers.get('x-oauth-scopes') || '';
+      const scopes = scopesHeader
+        ? scopesHeader.split(',').map((s) => s.trim()).filter(Boolean)
+        : [];
+      const rateLimitRemaining = parseInt(response.headers.get('x-ratelimit-remaining') || '', 10);
+      const rateLimitLimit = parseInt(response.headers.get('x-ratelimit-limit') || '', 10);
+
+      if (response.status === 401) {
+        return {
+          valid: false,
+          error: 'Invalid or expired GitHub Personal Access Token (401 Unauthorized). Please check your token.',
+        };
+      }
+
+      if (response.status === 403) {
+        const errorText = await response.text();
+        return {
+          valid: false,
+          error: `GitHub API access forbidden (403): ${errorText}`,
+        };
+      }
+
+      if (!response.ok) {
+        return {
+          valid: false,
+          error: `GitHub API error (${response.status}): ${response.statusText}`,
+        };
+      }
+
+      const userData = await response.json();
+      return {
+        valid: true,
+        username: userData.login,
+        name: userData.name,
+        avatarUrl: userData.avatar_url,
+        scopes,
+        rateLimitRemaining: isNaN(rateLimitRemaining) ? undefined : rateLimitRemaining,
+        rateLimitLimit: isNaN(rateLimitLimit) ? undefined : rateLimitLimit,
+      };
+    } catch (err: any) {
+      return {
+        valid: false,
+        error: err.message || 'Network error while communicating with GitHub API.',
+      };
+    }
+  }
+
   private formatErrorMessage(
     errorText: string,
     status: number,
@@ -130,13 +222,16 @@ export class GitHubClient {
     }
 
     if (status === 404) {
-      return `PR #${pullNumber} not found on repository ${owner}/${repository} (404 Not Found). Please verify the repo name and PR number. For private repositories, enter a GitHub Personal Access Token.`;
+      if (this.token) {
+        return `PR #${pullNumber} or repository "${owner}/${repository}" was not found (404 Not Found). Please verify the repo name and PR number, and ensure your Personal Access Token has the "repo" scope to read private repositories.`;
+      }
+      return `PR #${pullNumber} not found on repository "${owner}/${repository}" (404 Not Found). If this is a private repository, please enter and validate a GitHub Personal Access Token (PAT) with "repo" scope below.`;
     }
     if (status === 403 || status === 429) {
-      return `GitHub API rate limit exceeded or access forbidden (Status ${status}: ${parsedMsg}). Add a GitHub Personal Access Token to get 5,000 requests/hr.`;
+      return `GitHub API rate limit exceeded or access forbidden (Status ${status}: ${parsedMsg}). Add or validate a GitHub Personal Access Token to get 5,000 requests/hr.`;
     }
     if (status === 401) {
-      return `Invalid or expired GitHub Personal Access Token (401 Unauthorized).`;
+      return `Invalid or expired GitHub Personal Access Token (401 Unauthorized). Please check and re-validate your token.`;
     }
 
     return `Failed to fetch PR #${pullNumber} from ${owner}/${repository} (${status}): ${parsedMsg || errorText}`;
@@ -165,6 +260,8 @@ export class GitHubClient {
 
     const data = await response.json();
     return {
+      provider: 'github',
+      typeLabel: 'PR',
       owner,
       repository,
       number: data.number,
