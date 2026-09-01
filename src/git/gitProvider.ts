@@ -24,6 +24,10 @@ export interface UniversalTokenValidationResult {
   scopes?: string[];
   rateLimitRemaining?: number;
   rateLimitLimit?: number;
+  rateLimit?: {
+    remaining: number;
+    limit: number;
+  };
   error?: string;
 }
 
@@ -242,6 +246,10 @@ export async function validateRemoteToken(
       scopes: result.scopes,
       rateLimitRemaining: result.rateLimitRemaining,
       rateLimitLimit: result.rateLimitLimit,
+      rateLimit:
+        result.rateLimitRemaining !== undefined && result.rateLimitLimit !== undefined
+          ? { remaining: result.rateLimitRemaining, limit: result.rateLimitLimit }
+          : undefined,
       error: result.error,
     };
   }
