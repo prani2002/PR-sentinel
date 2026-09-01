@@ -43,8 +43,33 @@
         "command": "pr-sentinel.showFindings",
         "title": "PR Sentinel: Show Blast Radius Findings",
         "category": "PR Sentinel"
+      },
+      {
+        "command": "pr-sentinel.setToken",
+        "title": "PR Sentinel: Set Personal Access Token (PAT)",
+        "category": "PR Sentinel"
+      },
+      {
+        "command": "pr-sentinel.clearToken",
+        "title": "PR Sentinel: Clear Saved Token",
+        "category": "PR Sentinel"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "PR Sentinel",
+      "properties": {
+        "prSentinel.githubToken": {
+          "type": "string",
+          "default": "",
+          "description": "GitHub Personal Access Token with repo scope for analyzing private repositories."
+        },
+        "prSentinel.gitlabToken": {
+          "type": "string",
+          "default": "",
+          "description": "GitLab Personal Access Token with read_api and read_repository scopes."
+        }
+      }
+    }
   },
   "private": true,
   "type": "module",

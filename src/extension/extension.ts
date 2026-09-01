@@ -8,16 +8,19 @@ import { FindingsViewProvider } from '../ui/findingsView';
 export function activate(context: vscode.ExtensionContext): void {
   console.log('PR Sentinel extension is now active.');
 
-  // Register commands
-  registerCommands(context);
-
   // Register Findings Webview Provider
-  const provider = new FindingsViewProvider(context.extensionUri);
+  const findingsProvider = new FindingsViewProvider(context.extensionUri);
   context.subscriptions.push(
-    vscode.window.registerWebviewViewProvider(FindingsViewProvider.viewType, provider)
+    vscode.window.registerWebviewViewProvider(
+      FindingsViewProvider.viewType,
+      findingsProvider
+    )
   );
 
-  // Command to show findings view
+  // Register all extension commands
+  registerCommands(context, findingsProvider);
+
+  // Command to show/focus findings view in sidebar
   context.subscriptions.push(
     vscode.commands.registerCommand('pr-sentinel.showFindings', () => {
       vscode.commands.executeCommand('prSentinel.findingsView.focus');
