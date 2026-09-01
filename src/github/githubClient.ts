@@ -11,10 +11,13 @@ export class GitHubClient {
   private getHeaders(): Record<string, string> {
     const headers: Record<string, string> = {
       Accept: 'application/vnd.github.v3+json',
-      'User-Agent': 'PR-Sentinel-VSCode-Extension',
     };
+    // User-Agent is a restricted header in browser Fetch API, only set in Node/extension runtime
+    if (typeof window === 'undefined') {
+      headers['User-Agent'] = 'PR-Sentinel-VSCode-Extension';
+    }
     if (this.token) {
-      headers.Authorization = `token ${this.token}`;
+      headers.Authorization = `Bearer ${this.token}`;
     }
     return headers;
   }
