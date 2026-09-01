@@ -28,7 +28,7 @@ import {
 
 import { REAL_PR_SCENARIOS, PRScenario } from './data/mockScenarios';
 import { DeterministicPipeline } from './pipeline/deterministicPipeline';
-import { GitHubClient } from './github/githubClient';
+import { GitHubClient, parseGitHubInput } from './github/githubClient';
 import { Finding, ConsumerReference, PullRequestInfo, ChangedFile } from './models/types';
 import { ProjectFileSource } from './analyzer/projectScanner';
 
@@ -87,24 +87,31 @@ export default function App() {
 
   // Handler to fetch live GitHub PR
   const handleFetchLiveGitHubPR = async () => {
-    if (!githubRepoInput || !githubRepoInput.includes('/')) {
-      setFetchError('Please enter a valid owner/repo repository (e.g. facebook/react).');
-      return;
-    }
-    const prNum = parseInt(githubPrNumberInput, 10);
-    if (isNaN(prNum) || prNum <= 0) {
-      setFetchError('Please enter a valid positive PR number.');
+    const parsed = parseGitHubInput(githubRepoInput, githubPrNumberInput);
+    if (parsed.error || !parsed.target) {
+      setFetchError(parsed.error || 'Please enter a valid GitHub repository or PR URL.');
       return;
     }
 
-    const [owner, repo] = githubRepoInput.split('/').map((s) => s.trim());
+    const { owner, repo, prNumber } = parsed.target;
+    if (!prNumber || prNumber <= 0) {
+      setFetchError('Please enter a valid positive Pull Request number (e.g. 28000).');
+      return;
+    }
+
     setIsFetchingGithub(true);
     setFetchError(null);
 
     try {
       const client = new GitHubClient(githubTokenInput || undefined);
-      const prInfo: PullRequestInfo = await client.getPullRequest(owner, repo, prNum);
-      const changedFiles: ChangedFile[] = await client.getPullRequestFiles(owner, repo, prNum);
+      const prInfo: PullRequestInfo = await client.getPullRequest(owner, repo, prNumber);
+      const changedFiles: ChangedFile[] = await client.getPullRequestFiles(owner, repo, prNumber);
+
+      if (!changedFiles || changedFiles.length === 0) {
+        setFetchError(`PR #${prNumber} on ${owner}/${repo} returned no changed files.`);
+        setIsFetchingGithub(false);
+        return;
+      }
 
       // Build workspace file representations from patch data
       const workspaceFiles: ProjectFileSource[] = changedFiles.map((f) => {
@@ -123,7 +130,7 @@ export default function App() {
       });
 
       const newScenario: PRScenario = {
-        id: `github-${owner}-${repo}-${prNum}`,
+        id: `github-${owner}-${repo}-${prNumber}`,
         pr: prInfo,
         changedFiles,
         workspaceFiles,
@@ -754,14 +761,24 @@ export default function App() {
             <div className="space-y-3 text-xs text-[#d4d4d8]">
               <div>
                 <label className="block text-[11px] font-semibold text-[#a1a1aa] mb-1">
-                  Repository (owner/repo)
+                  GitHub Repository or PR URL
                 </label>
                 <input
                   type="text"
                   value={githubRepoInput}
-                  onChange={(e) => setGithubRepoInput(e.target.value)}
-                  placeholder="e.g. facebook/react or vercel/next.js"
-                  className="w-full bg-[#141416] border border-[#27272a] rounded px-3 py-2 text-xs text-white focus:border-[#38bdf8] outline-none"
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    setGithubRepoInput(val);
+                    setFetchError(null);
+                    const parsed = parseGitHubInput(val);
+                    if (parsed.target) {
+                      if (parsed.target.prNumber) {
+                        setGithubPrNumberInput(parsed.target.prNumber.toString());
+                      }
+                    }
+                  }}
+                  placeholder="e.g. facebook/react or https://github.com/facebook/react/pull/28000"
+                  className="w-full bg-[#141416] border border-[#27272a] rounded px-3 py-2 text-xs text-white focus:border-[#38bdf8] outline-none font-mono placeholder:font-sans"
                 />
               </div>
 
@@ -772,28 +789,77 @@ export default function App() {
                 <input
                   type="number"
                   value={githubPrNumberInput}
-                  onChange={(e) => setGithubPrNumberInput(e.target.value)}
+                  onChange={(e) => {
+                    setGithubPrNumberInput(e.target.value);
+                    setFetchError(null);
+                  }}
                   placeholder="e.g. 28000"
-                  className="w-full bg-[#141416] border border-[#27272a] rounded px-3 py-2 text-xs text-white focus:border-[#38bdf8] outline-none"
+                  className="w-full bg-[#141416] border border-[#27272a] rounded px-3 py-2 text-xs text-white focus:border-[#38bdf8] outline-none font-mono placeholder:font-sans"
                 />
+              </div>
+
+              {/* Quick Preset Buttons */}
+              <div>
+                <span className="block text-[10px] uppercase font-bold tracking-wider text-[#71717a] mb-1.5">
+                  Try Live Examples:
+                </span>
+                <div className="flex flex-wrap gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setGithubRepoInput('facebook/react');
+                      setGithubPrNumberInput('28000');
+                      setFetchError(null);
+                    }}
+                    className="px-2 py-1 rounded bg-[#202024] hover:bg-[#27272a] text-[#38bdf8] border border-[#2e2e34] text-[11px] font-mono transition"
+                  >
+                    facebook/react #28000
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setGithubRepoInput('reduxjs/redux');
+                      setGithubPrNumberInput('4500');
+                      setFetchError(null);
+                    }}
+                    className="px-2 py-1 rounded bg-[#202024] hover:bg-[#27272a] text-[#38bdf8] border border-[#2e2e34] text-[11px] font-mono transition"
+                  >
+                    reduxjs/redux #4500
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setGithubRepoInput('microsoft/TypeScript');
+                      setGithubPrNumberInput('57000');
+                      setFetchError(null);
+                    }}
+                    className="px-2 py-1 rounded bg-[#202024] hover:bg-[#27272a] text-[#38bdf8] border border-[#2e2e34] text-[11px] font-mono transition"
+                  >
+                    microsoft/TypeScript #57000
+                  </button>
+                </div>
               </div>
 
               <div>
                 <label className="block text-[11px] font-semibold text-[#a1a1aa] mb-1">
-                  GitHub Personal Access Token (Optional for public repos)
+                  GitHub Personal Access Token <span className="text-[#71717a] font-normal">(Optional for public repos)</span>
                 </label>
                 <input
                   type="password"
                   value={githubTokenInput}
                   onChange={(e) => setGithubTokenInput(e.target.value)}
-                  placeholder="ghp_... (increases rate limit)"
-                  className="w-full bg-[#141416] border border-[#27272a] rounded px-3 py-2 text-xs text-white focus:border-[#38bdf8] outline-none"
+                  placeholder="ghp_... (increases rate limit to 5,000 req/hr)"
+                  className="w-full bg-[#141416] border border-[#27272a] rounded px-3 py-2 text-xs text-white focus:border-[#38bdf8] outline-none font-mono placeholder:font-sans"
                 />
               </div>
 
               {fetchError && (
-                <div className="p-2.5 rounded bg-red-950/60 border border-red-800/60 text-red-300 text-xs">
-                  {fetchError}
+                <div className="p-3 rounded bg-red-950/70 border border-red-800/80 text-red-300 text-xs leading-relaxed space-y-1">
+                  <div className="font-bold flex items-center gap-1.5 text-red-200">
+                    <AlertTriangle className="w-3.5 h-3.5 text-red-400 shrink-0" />
+                    <span>Unable to fetch PR</span>
+                  </div>
+                  <div>{fetchError}</div>
                 </div>
               )}
             </div>
