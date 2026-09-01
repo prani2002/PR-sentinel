@@ -49,10 +49,10 @@ export class GitLabClient {
   private token?: string;
   private baseUrl: string;
 
-  constructor(token?: string, host: string = 'https://gitlab.com') {
-    this.token = token?.trim();
+  constructor(token?: any, host: string = 'https://gitlab.com') {
+    this.token = typeof token === 'string' ? token.trim() : undefined;
     // Normalize host URL
-    let cleanHost = (host || 'https://gitlab.com').trim();
+    let cleanHost = (typeof host === 'string' && host ? host : 'https://gitlab.com').trim();
     if (!cleanHost.startsWith('http://') && !cleanHost.startsWith('https://')) {
       cleanHost = `https://${cleanHost}`;
     }

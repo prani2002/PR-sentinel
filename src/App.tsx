@@ -1177,7 +1177,7 @@ export default function App() {
                       </div>
                     ) : (
                       <div className="flex items-start gap-2">
-                        <XCircle  className="w-3.5 h-3.5 text-[#ef4444] shrink-0 mt-0.5" />
+                        <XCircle className="w-3.5 h-3.5 text-[#ef4444] shrink-0 mt-0.5" />
                         <div>
                           <div className="font-semibold text-red-200">Validation Failed</div>
                           <div className="text-[11px] text-red-300">{tokenValidation.error}</div>

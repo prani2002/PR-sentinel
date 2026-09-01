@@ -234,7 +234,7 @@ export function registerCommands(
         // 4. If PR number was not in the URL, prompt for it
         if (!target.number) {
           const prNumberInput = await vscode.window.showInputBox({
-            prompt: `Enter ${target.typeLabel} number for ${target.owner}/${target.repo}`,
+            prompt: `Enter ${target.typeLabel} number for ${target.provider === 'gitlab' ? target.projectPath : target.owner + '/' + target.repo}`,
             placeHolder: 'e.g. 1',
             ignoreFocusOut: true,
             validateInput: (val) => {
@@ -263,16 +263,17 @@ export function registerCommands(
         let attemptFetch = async (currentToken?: string) => {
           return await fetchRemotePullOrMergeRequest(
             target,
-            target.number!,
             currentToken
           );
         };
+
+        const targetIdentifier = target.provider === 'gitlab' ? target.projectPath : `${target.owner}/${target.repo}`;
 
         try {
           fetchResult = await vscode.window.withProgress(
             {
               location: vscode.ProgressLocation.Notification,
-              title: `PR Sentinel: Fetching ${target.typeLabel} #${target.number} from ${target.owner}/${target.repo}...`,
+              title: `PR Sentinel: Fetching ${target.typeLabel} #${target.number} from ${targetIdentifier}...`,
               cancellable: false,
             },
             async (progress) => {
@@ -291,7 +292,7 @@ export function registerCommands(
 
           if (isAuthError) {
             const action = await vscode.window.showWarningMessage(
-              `PR Sentinel: ${target.typeLabel} #${target.number} not found on "${target.owner}/${target.repo}" (or repository is private/rate-limited).`,
+              `PR Sentinel: ${target.typeLabel} #${target.number} not found on "${targetIdentifier}" (or repository is private/rate-limited).`,
               'Enter Access Token (PAT)',
               'Cancel'
             );
@@ -301,7 +302,7 @@ export function registerCommands(
                 context,
                 target.provider,
                 target.host,
-                `Enter Personal Access Token for ${target.provider === 'gitlab' ? 'GitLab' : 'GitHub'} to access "${target.owner}/${target.repo}":`
+                `Enter Personal Access Token for ${target.provider === 'gitlab' ? 'GitLab' : 'GitHub'} to access "${targetIdentifier}":`
               );
               if (newToken) {
                 token = newToken;

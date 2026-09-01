@@ -137,22 +137,37 @@ export function parseGitUrlOrInput(
   let projectPath = '';
 
   if (provider === 'gitlab') {
-    // GitLab URL pattern: .../-/merge_requests/123 or .../merge_requests/123
-    const mrRegex = /(?:^|\/)(.+?)(?:\/\-)?\/merge_requests\/(\d+)/i;
+    // GitLab URL patterns:
+    // 1) .../-/merge_requests/123
+    // 2) .../merge_requests/123
+    const mrRegex = /(?:^|\/)(.+?)(?:\/-\/merge_requests\/|\/merge_requests\/)(\d+)/i;
     const mrMatch = cleaned.match(mrRegex);
     if (mrMatch) {
-      projectPath = mrMatch[1].replace(/^\/+|\/+$/g, '');
+      projectPath = mrMatch[1].replace(/\/-\/?$/, '').replace(/^\/+|\/+$/g, '');
       extractedNumber = parseInt(mrMatch[2], 10);
     } else {
-      projectPath = cleaned.replace(/\.git$/i, '');
+      projectPath = cleaned.replace(/\/-\/?$/, '').replace(/\.git$/i, '').replace(/^\/+|\/+$/g, '');
     }
 
-    const segments = projectPath.split('/').filter(Boolean).filter((s) => !s.includes(':') && !s.includes('@') && s !== 'https' && s !== 'http');
+    const segments = projectPath
+      .split('/')
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .filter((s) => !s.includes(':') && !s.includes('@') && s !== 'https' && s !== 'http' && s !== '-');
+
     if (segments.length < 1) {
       return {
         error: 'Invalid GitLab project path. Example: gitlab-org/gitlab or https://gitlab.com/gitlab-org/gitlab/-/merge_requests/120000',
       };
     }
+
+    const validSegmentRegex = /^[a-zA-Z0-9_.-]+$/;
+    if (!segments.every((s) => validSegmentRegex.test(s))) {
+      return {
+        error: 'Invalid characters in GitLab project path. Segments must contain only alphanumeric characters, dots, underscores, or hyphens.',
+      };
+    }
+
     repo = segments[segments.length - 1];
     owner = segments.slice(0, -1).join('/') || segments[0];
     projectPath = segments.join('/');
@@ -175,6 +190,14 @@ export function parseGitUrlOrInput(
         };
       }
     }
+
+    const validSegmentRegex = /^[a-zA-Z0-9_.-]+$/;
+    if (!owner || !repo || !validSegmentRegex.test(owner) || !validSegmentRegex.test(repo)) {
+      return {
+        error: 'Invalid repository or PR format. Please provide a valid GitHub PR URL (e.g. github.com/owner/repo/pull/123) or owner/repo path.',
+      };
+    }
+
     projectPath = `${owner}/${repo}`;
   }
 
@@ -183,15 +206,6 @@ export function parseGitUrlOrInput(
     if (!isNaN(parsedNum) && parsedNum > 0) {
       extractedNumber = parsedNum;
     }
-  }
-
-  const validTokenRegex = /^[a-zA-Z0-9_.-]+$/;
-  if (!owner || !repo || !validTokenRegex.test(owner) || !validTokenRegex.test(repo)) {
-    return {
-      error: `Invalid repository or ${provider === 'gitlab' ? 'MR' : 'PR'} format. Please provide a valid ${
-        provider === 'gitlab' ? 'GitLab MR URL (e.g. gitlab.com/owner/repo/-/merge_requests/123)' : 'GitHub PR URL (e.g. github.com/owner/repo/pull/123)'
-      } or owner/repo path.`,
-    };
   }
 
   return {
@@ -260,23 +274,34 @@ export async function validateRemoteToken(
  */
 export async function fetchRemotePullOrMergeRequest(
   target: ParsedGitTarget,
-  token?: string
+  tokenOrNumber?: string | number,
+  optionalToken?: string
 ): Promise<{ prInfo: PullRequestInfo; changedFiles: ChangedFile[] }> {
-  if (!target.number || target.number <= 0) {
+  let prNumber = target.number;
+  let token: string | undefined;
+
+  if (typeof tokenOrNumber === 'number') {
+    prNumber = tokenOrNumber;
+    token = typeof optionalToken === 'string' ? optionalToken.trim() : undefined;
+  } else if (typeof tokenOrNumber === 'string') {
+    token = tokenOrNumber.trim();
+  }
+
+  if (!prNumber || prNumber <= 0) {
     throw new Error(`Please provide a valid ${target.typeLabel} number.`);
   }
 
   if (target.provider === 'gitlab') {
     const hostUrl = target.host ? `https://${target.host}` : 'https://gitlab.com';
     const client = new GitLabClient(token, hostUrl);
-    const prInfo = await client.getMergeRequest(target.projectPath, target.number);
-    const changedFiles = await client.getMergeRequestChanges(target.projectPath, target.number);
+    const prInfo = await client.getMergeRequest(target.projectPath, prNumber);
+    const changedFiles = await client.getMergeRequestChanges(target.projectPath, prNumber);
 
     return { prInfo, changedFiles };
   } else {
     const client = new GitHubClient(token);
-    const prInfo = await client.getPullRequest(target.owner, target.repo, target.number);
-    const changedFiles = await client.getPullRequestFiles(target.owner, target.repo, target.number);
+    const prInfo = await client.getPullRequest(target.owner, target.repo, prNumber);
+    const changedFiles = await client.getPullRequestFiles(target.owner, target.repo, prNumber);
 
     return { prInfo, changedFiles };
   }

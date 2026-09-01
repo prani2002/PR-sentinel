@@ -127,8 +127,8 @@ export class GitHubClient {
   private token?: string;
   private baseUrl = 'https://api.github.com';
 
-  constructor(token?: string) {
-    this.token = token?.trim();
+  constructor(token?: any) {
+    this.token = typeof token === 'string' ? token.trim() : undefined;
   }
 
   private getHeaders(): Record<string, string> {
