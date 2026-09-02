@@ -306,3 +306,23 @@ export async function fetchRemotePullOrMergeRequest(
     return { prInfo, changedFiles };
   }
 }
+
+/**
+ * Universal PR/MR Lister that lists open PRs/MRs from GitHub or GitLab
+ */
+export async function listRemotePullOrMergeRequests(
+  target: ParsedGitTarget,
+  token?: string,
+  state: 'open' | 'closed' | 'all' = 'open'
+): Promise<PullRequestInfo[]> {
+  if (target.provider === 'gitlab') {
+    const hostUrl = target.host ? `https://${target.host}` : 'https://gitlab.com';
+    const client = new GitLabClient(token, hostUrl);
+    const gitlabState = state === 'open' ? 'opened' : state;
+    return await client.listMergeRequests(target.projectPath, gitlabState as any);
+  } else {
+    const client = new GitHubClient(token);
+    return await client.listPullRequests(target.owner, target.repo, state);
+  }
+}
+

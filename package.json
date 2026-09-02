@@ -36,12 +36,22 @@
     "commands": [
       {
         "command": "pr-sentinel.analyzePR",
-        "title": "PR Sentinel: Analyze Current PR",
+        "title": "PR Sentinel: Analyze & Review Current PR / MR",
+        "category": "PR Sentinel"
+      },
+      {
+        "command": "pr-sentinel.linkRepo",
+        "title": "PR Sentinel: Link Workspace Repository & Browse Open PRs",
+        "category": "PR Sentinel"
+      },
+      {
+        "command": "pr-sentinel.reviewPR",
+        "title": "PR Sentinel: Run Senior Staff PR Review",
         "category": "PR Sentinel"
       },
       {
         "command": "pr-sentinel.showFindings",
-        "title": "PR Sentinel: Show Blast Radius Findings",
+        "title": "PR Sentinel: Show Blast Radius & Review Findings",
         "category": "PR Sentinel"
       },
       {

@@ -12,9 +12,6 @@ import {
   Search,
   Settings,
   User,
-  MoreHorizontal,
-  Sun,
-  LayoutGrid,
   ArrowRight,
   CheckCircle,
   FileText,
@@ -28,9 +25,19 @@ import {
   ShieldCheck,
   Lock,
   Unlock,
-  UserCheck,
   Check,
-  XCircle
+  XCircle,
+  Sparkles,
+  Zap,
+  Bug,
+  Copy,
+  CheckCheck,
+  FolderGit2,
+  GitPullRequest,
+  GitMerge,
+  Split,
+  Terminal,
+  Filter
 } from 'lucide-react';
 
 import { REAL_PR_SCENARIOS, PRScenario } from './data/mockScenarios';
@@ -39,23 +46,31 @@ import {
   parseGitUrlOrInput,
   fetchRemotePullOrMergeRequest,
   validateRemoteToken,
+  listRemotePullOrMergeRequests,
   GitProviderType,
   ParsedGitTarget,
   UniversalTokenValidationResult
 } from './git/gitProvider';
-import { Finding, ConsumerReference, PullRequestInfo, ChangedFile } from './models/types';
+import { Finding, ConsumerReference, PullRequestInfo, ChangedFile, PRReviewReport, ReviewItem, ReviewCategory, ReviewSeverity } from './models/types';
 import { ProjectFileSource } from './analyzer/projectScanner';
+import { CodeReviewer } from './reviewer/codeReviewer';
+import { RepoLinker } from './reviewer/repoLinker';
 import { GitHubIcon, GitLabIcon } from './ui/GitIcons';
 
 export default function App() {
   const [selectedScenarioIndex, setSelectedScenarioIndex] = useState<number>(0);
   const [customScenario, setCustomScenario] = useState<PRScenario | null>(null);
-  const [activeTab, setActiveTab] = useState<'diff' | 'consumer' | 'blastRadius'>('diff');
+  const [mainView, setMainView] = useState<'reviewer' | 'blastRadius' | 'diff' | 'repoLinker'>('reviewer');
+  const [selectedCategory, setSelectedCategory] = useState<string>('all');
+  const [selectedSeverity, setSelectedSeverity] = useState<string>('all');
   const [selectedConsumerFile, setSelectedConsumerFile] = useState<string>('frontend/Checkout.tsx');
   const [highlightedLine, setHighlightedLine] = useState<number>(6);
   const [showExplanationModal, setShowExplanationModal] = useState<boolean>(false);
   const [showFetchModal, setShowFetchModal] = useState<boolean>(false);
+  const [showExportModal, setShowExportModal] = useState<boolean>(false);
   const [isReanalyzing, setIsReanalyzing] = useState<boolean>(false);
+  const [copiedReview, setCopiedReview] = useState<boolean>(false);
+  const [appliedFixes, setAppliedFixes] = useState<Record<string, boolean>>({});
 
   // Live Git Provider fetch & token states
   const [providerMode, setProviderMode] = useState<'auto' | 'github' | 'gitlab'>('auto');
@@ -68,6 +83,10 @@ export default function App() {
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [showTokenHelp, setShowTokenHelp] = useState<boolean>(false);
 
+  // Repository Linker state
+  const [openPRsList, setOpenPRsList] = useState<PullRequestInfo[]>([]);
+  const [isLoadingPRs, setIsLoadingPRs] = useState<boolean>(false);
+
   // Load saved token from localStorage on initial render
   useEffect(() => {
     try {
@@ -79,7 +98,7 @@ export default function App() {
         setGitTokenInput(savedGlToken);
       }
     } catch {
-      // localStorage may be disabled in some sandboxes
+      // localStorage may be disabled in some environments
     }
   }, []);
 
@@ -94,7 +113,7 @@ export default function App() {
     );
   }, [gitRepoInput, gitNumberInput, providerMode]);
 
-  // Run the real deterministic AST analysis pipeline dynamically on current PR/MR scenario
+  // Run deterministic AST analysis pipeline
   const pipeline = useMemo(() => new DeterministicPipeline(), []);
   const analysisResult = useMemo(() => {
     return pipeline.run(
@@ -103,6 +122,17 @@ export default function App() {
       scenario.workspaceFiles
     );
   }, [pipeline, scenario]);
+
+  // Run Senior Code Reviewer Engine
+  const reviewer = useMemo(() => new CodeReviewer(), []);
+  const reviewReport: PRReviewReport = useMemo(() => {
+    return reviewer.reviewPullRequest(
+      scenario.pr,
+      scenario.changedFiles,
+      analysisResult.findings,
+      scenario.workspaceFiles
+    );
+  }, [reviewer, scenario, analysisResult]);
 
   const [selectedFindingId, setSelectedFindingId] = useState<string | null>(null);
 
@@ -115,17 +145,39 @@ export default function App() {
     );
   }, [analysisResult, selectedFindingId]);
 
+  // Filtered review items
+  const filteredReviewItems = useMemo(() => {
+    return reviewReport.items.filter((item) => {
+      const catMatch = selectedCategory === 'all' || item.category === selectedCategory;
+      const sevMatch = selectedSeverity === 'all' || item.severity === selectedSeverity;
+      return catMatch && sevMatch;
+    });
+  }, [reviewReport, selectedCategory, selectedSeverity]);
+
   const handleReanalyze = () => {
     setIsReanalyzing(true);
     setTimeout(() => {
       setIsReanalyzing(false);
-    }, 600);
+    }, 500);
   };
 
   const handleOpenConsumer = (file: string, line: number) => {
     setSelectedConsumerFile(file);
     setHighlightedLine(line);
-    setActiveTab('consumer');
+    setMainView('diff');
+  };
+
+  const handleApplyFix = (itemId: string) => {
+    setAppliedFixes((prev) => ({ ...prev, [itemId]: true }));
+    setTimeout(() => {
+      // Keep applied state
+    }, 100);
+  };
+
+  const handleCopyReviewMarkdown = () => {
+    navigator.clipboard.writeText(reviewReport.generatedMarkdownReview);
+    setCopiedReview(true);
+    setTimeout(() => setCopiedReview(false), 2000);
   };
 
   // Validate personal access token against GitHub/GitLab
@@ -166,14 +218,18 @@ export default function App() {
   };
 
   // Handler to fetch live PR/MR from GitHub or GitLab and immediately review
-  const handleFetchRemotePrOrMr = async () => {
+  const handleFetchRemotePrOrMr = async (explicitPrNum?: number) => {
     const parsed = detectedTarget;
     if (parsed.error || !parsed.target) {
       setFetchError(parsed.error || 'Please enter a valid GitHub or GitLab URL or repository path.');
       return;
     }
 
-    const target = parsed.target;
+    const target: ParsedGitTarget = {
+      ...parsed.target,
+      number: explicitPrNum || parsed.target.number,
+    };
+
     if (!target.number || target.number <= 0) {
       setFetchError(`Please enter a valid positive ${target.typeLabel} number.`);
       return;
@@ -224,1080 +280,823 @@ export default function App() {
       setCustomScenario(newScenario);
       setSelectedFindingId(null);
       setShowFetchModal(false);
+      setMainView('reviewer');
       if (changedFiles.length > 0) {
         setSelectedConsumerFile(changedFiles[0].filename);
       }
     } catch (err: any) {
       console.error('Failed to fetch remote Git PR/MR:', err);
-      setFetchError(err.message || 'Error communicating with Git Provider API. Rate limit or permissions.');
+      setFetchError(err.message || 'Error communicating with Git Provider API. Check permissions or rate limit.');
     } finally {
       setIsFetchingRemote(false);
     }
   };
 
-  // Find active consumer file content
-  const activeConsumerContent = useMemo(() => {
-    const file = scenario.workspaceFiles.find((f) => f.path === selectedConsumerFile);
-    return file ? file.content : '';
-  }, [scenario, selectedConsumerFile]);
-
-  // Find active diff file content
-  const activeDiffFile = scenario.changedFiles[0] || {
-    filename: 'No changed files',
-    status: 'none',
-    additions: 0,
-    deletions: 0,
-    changes: 0,
-    sha: '',
-    patch: '',
+  // Handler to fetch all open PRs for the repository
+  const handleFetchOpenPRsForRepo = async () => {
+    if (!detectedTarget.target) return;
+    setIsLoadingPRs(true);
+    try {
+      const prs = await listRemotePullOrMergeRequests(
+        detectedTarget.target,
+        gitTokenInput || undefined,
+        'open'
+      );
+      setOpenPRsList(prs);
+    } catch (err: any) {
+      console.warn('Could not list open PRs:', err);
+    } finally {
+      setIsLoadingPRs(false);
+    }
   };
 
-  const currentProvider = scenario.pr.provider || (scenario.id.includes('gitlab') ? 'gitlab' : 'github');
-  const currentTypeLabel = scenario.pr.typeLabel || (currentProvider === 'gitlab' ? 'MR' : 'PR');
-
   return (
-    <div className="h-screen w-screen flex flex-col bg-[#141416] text-[#cccccc] font-sans overflow-hidden select-none">
-      {/* VS Code Title Bar */}
-      <header className="h-9 bg-[#18181b] border-b border-[#27272a] flex items-center justify-between px-3 text-xs text-[#a1a1aa] shrink-0">
-        <div className="flex items-center space-x-3">
-          <div className="flex items-center space-x-1.5 mr-2">
-            <div className="w-3 h-3 rounded-full bg-[#ef4444] opacity-85 hover:opacity-100 transition cursor-pointer" />
-            <div className="w-3 h-3 rounded-full bg-[#eab308] opacity-85 hover:opacity-100 transition cursor-pointer" />
-            <div className="w-3 h-3 rounded-full bg-[#22c55e] opacity-85 hover:opacity-100 transition cursor-pointer" />
+    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-blue-600 selection:text-white">
+      {/* Top Navbar */}
+      <header className="h-14 border-b border-slate-800 bg-slate-900/90 backdrop-blur px-4 flex items-center justify-between sticky top-0 z-30">
+        <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2 bg-gradient-to-r from-blue-600 to-indigo-600 text-white px-2.5 py-1 rounded-md font-semibold text-sm shadow-sm">
+            <Shield className="w-4 h-4" />
+            <span>PR Sentinel</span>
           </div>
-
-          <div className="flex items-center gap-1.5 text-[#a1a1aa] text-[12px] font-mono tracking-wide">
-            {currentProvider === 'gitlab' ? (
-              <span className="flex items-center gap-1 text-[#fc6d26] font-semibold">
-                <GitLabIcon className="w-3.5 h-3.5" />
-                <span>GitLab</span>
-              </span>
-            ) : (
-              <span className="flex items-center gap-1 text-white font-semibold">
-                <GitHubIcon className="w-3.5 h-3.5" />
-                <span>GitHub</span>
-              </span>
-            )}
-            <span className="text-[#52525b]">•</span>
-            <span>
-              {scenario.pr.projectPath || `${scenario.pr.owner}/${scenario.pr.repository}`} ({currentTypeLabel} #{scenario.pr.number})
-            </span>
-          </div>
+          <span className="text-xs bg-indigo-500/20 text-indigo-300 font-medium px-2 py-0.5 rounded border border-indigo-500/30 flex items-center gap-1">
+            <Sparkles className="w-3 h-3 text-indigo-400" />
+            Senior Staff Code Reviewer & AST Sentinel
+          </span>
         </div>
 
-        {/* PR Switcher Dropdown & Live Fetch Button */}
-        <div className="flex-1 max-w-xl mx-4 flex justify-center items-center gap-2">
-          <span className="text-[11px] text-[#71717a]">Target:</span>
-          <select
-            value={customScenario ? 'custom' : selectedScenarioIndex}
-            onChange={(e) => {
-              if (e.target.value === 'custom') return;
-              setCustomScenario(null);
-              setSelectedScenarioIndex(Number(e.target.value));
-              setSelectedFindingId(null);
-            }}
-            className="bg-[#202024] text-xs text-[#e4e4e7] border border-[#2e2e34] rounded px-2.5 py-1 outline-none focus:border-[#38bdf8] max-w-[280px] truncate"
-          >
+        {/* Action Controls */}
+        <div className="flex items-center gap-3">
+          {/* Quick Scenario Selector */}
+          <div className="flex items-center gap-1.5 bg-slate-800/80 border border-slate-700/80 rounded-lg p-1 text-xs">
+            <span className="text-slate-400 px-2 font-medium">Scenario:</span>
+            {REAL_PR_SCENARIOS.map((sc, idx) => (
+              <button
+                key={sc.id}
+                onClick={() => {
+                  setCustomScenario(null);
+                  setSelectedScenarioIndex(idx);
+                  setSelectedFindingId(null);
+                  setAppliedFixes({});
+                }}
+                className={`px-2.5 py-1 rounded transition-colors font-medium flex items-center gap-1.5 ${
+                  !customScenario && selectedScenarioIndex === idx
+                    ? 'bg-blue-600 text-white shadow-sm'
+                    : 'text-slate-300 hover:bg-slate-700/60'
+                }`}
+              >
+                {sc.pr.provider === 'gitlab' ? (
+                  <GitLabIcon className="w-3 h-3 text-orange-400" />
+                ) : (
+                  <GitHubIcon className="w-3 h-3 text-white" />
+                )}
+                <span>
+                  {sc.pr.typeLabel} #{sc.pr.number}
+                </span>
+              </button>
+            ))}
             {customScenario && (
-              <option value="custom">
-                [{customScenario.pr.provider === 'gitlab' ? 'GitLab MR' : 'GitHub PR'}] {customScenario.pr.owner}/{customScenario.pr.repository} #{customScenario.pr.number}
-              </option>
+              <span className="px-2.5 py-1 rounded bg-indigo-600 text-white font-medium flex items-center gap-1">
+                {customScenario.pr.provider === 'gitlab' ? (
+                  <GitLabIcon className="w-3 h-3 text-orange-400" />
+                ) : (
+                  <GitHubIcon className="w-3 h-3 text-white" />
+                )}
+                <span>Live {customScenario.pr.typeLabel} #{customScenario.pr.number}</span>
+              </span>
             )}
-            {REAL_PR_SCENARIOS.map((sc, idx) => {
-              const p = sc.pr.provider || (sc.id.includes('gitlab') ? 'gitlab' : 'github');
-              const t = sc.pr.typeLabel || (p === 'gitlab' ? 'MR' : 'PR');
-              return (
-                <option key={sc.id} value={idx}>
-                  [{p === 'gitlab' ? 'GitLab' : 'GitHub'} {t} #{sc.pr.number}] {sc.pr.title.slice(0, 32)}...
-                </option>
-              );
-            })}
-          </select>
+          </div>
 
+          {/* Fetch Live PR Button */}
           <button
             onClick={() => setShowFetchModal(true)}
-            className="flex items-center gap-1.5 px-2.5 py-1 rounded bg-[#0284c7]/20 hover:bg-[#0284c7]/30 text-[#38bdf8] border border-[#0284c7]/40 text-xs font-medium transition cursor-pointer"
-            title="Fetch any live PR or MR from GitHub or GitLab"
+            className="flex items-center gap-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-xs px-3 py-1.5 rounded-lg transition-colors font-medium"
           >
-            <DownloadCloud className="w-3.5 h-3.5" />
-            <span>Fetch from GitHub / GitLab</span>
+            <FolderGit2 className="w-3.5 h-3.5 text-blue-400" />
+            <span>Link Remote Repo / PR</span>
           </button>
 
-          {tokenValidation?.valid ? (
-            <button
-              onClick={() => setShowFetchModal(true)}
-              className="flex items-center gap-1 px-2 py-0.5 rounded bg-[#166534]/40 hover:bg-[#166534]/60 text-[#86efac] border border-[#22c55e]/40 text-[11px] font-medium transition cursor-pointer"
-              title={`Authenticated via PAT: ${tokenValidation.username ? '@' + tokenValidation.username : 'Active'}`}
-            >
-              <ShieldCheck className="w-3 h-3 text-[#22c55e]" />
-              <span>PAT: {tokenValidation.username ? `@${tokenValidation.username}` : 'Active'}</span>
-            </button>
-          ) : gitTokenInput ? (
-            <button
-              onClick={() => setShowFetchModal(true)}
-              className="flex items-center gap-1 px-2 py-0.5 rounded bg-[#854d0e]/30 hover:bg-[#854d0e]/50 text-[#fde047] border border-[#ca8a04]/40 text-[11px] font-medium transition cursor-pointer"
-              title="PAT entered - click to validate"
-            >
-              <Key className="w-3 h-3 text-[#eab308]" />
-              <span>PAT (Unverified)</span>
-            </button>
-          ) : null}
-        </div>
+          {/* Export Review Button */}
+          <button
+            onClick={() => setShowExportModal(true)}
+            className="flex items-center gap-1.5 bg-blue-600 hover:bg-blue-500 text-white text-xs px-3 py-1.5 rounded-lg transition-colors font-medium shadow-sm"
+          >
+            <DownloadCloud className="w-3.5 h-3.5" />
+            <span>Export Review Markdown</span>
+          </button>
 
-        <div className="flex items-center space-x-3 text-[#a1a1aa]">
-          <LayoutGrid className="w-3.5 h-3.5 hover:text-white cursor-pointer" />
-          <MoreHorizontal className="w-3.5 h-3.5 hover:text-white cursor-pointer" />
-          <Settings className="w-3.5 h-3.5 hover:text-white cursor-pointer" />
+          {/* Re-analyze Button */}
+          <button
+            onClick={handleReanalyze}
+            disabled={isReanalyzing}
+            className="p-1.5 text-slate-400 hover:text-slate-200 hover:bg-slate-800 rounded-lg transition-colors"
+            title="Re-run pipeline analysis"
+          >
+            <RefreshCw className={`w-4 h-4 ${isReanalyzing ? 'animate-spin text-blue-400' : ''}`} />
+          </button>
         </div>
       </header>
 
-      {/* Main Workspace Layout */}
-      <div className="flex flex-1 overflow-hidden">
-        {/* Left Activity Bar */}
-        <aside className="w-12 bg-[#18181b] border-r border-[#27272a] flex flex-col items-center py-2 space-y-4 text-[#71717a] shrink-0 z-10">
-          <button className="p-2 hover:text-[#d4d4d8] cursor-pointer" title="Explorer">
-            <FileText className="w-5 h-5" />
-          </button>
-          <button className="p-2 hover:text-[#d4d4d8] cursor-pointer" title="Search">
-            <Search className="w-5 h-5" />
-          </button>
-          <button className="p-2 hover:text-[#d4d4d8] cursor-pointer" title="Source Control">
-            <GitBranch className="w-5 h-5" />
-          </button>
-          <button className="p-2 hover:text-[#d4d4d8] cursor-pointer" title="Run and Debug">
-            <Workflow className="w-5 h-5" />
-          </button>
-          <button className="p-2 hover:text-[#d4d4d8] cursor-pointer" title="Extensions">
-            <Layers className="w-5 h-5" />
-          </button>
-
-          {/* PR Sentinel Extension Tab */}
-          <button
-            className="p-2 text-[#38bdf8] border-l-2 border-[#0284c7] w-full flex justify-center bg-[#1e293b]/40 cursor-pointer"
-            title="PR Sentinel"
-          >
-            <Shield className="w-5 h-5 fill-[#0284c7]/20" />
-          </button>
-
-          <div className="mt-auto flex flex-col space-y-3 pb-1">
-            <button className="p-2 hover:text-[#d4d4d8] cursor-pointer">
-              <User className="w-5 h-5" />
-            </button>
-            <button className="p-2 hover:text-[#d4d4d8] cursor-pointer">
-              <Settings className="w-5 h-5" />
-            </button>
-          </div>
-        </aside>
-
-        {/* Primary Sidebar: PR Sentinel Findings View */}
-        <aside className="w-72 bg-[#18181b] border-r border-[#27272a] flex flex-col shrink-0 overflow-y-auto">
-          {/* Header */}
-          <div className="h-9 px-4 flex items-center justify-between text-[11px] font-bold uppercase tracking-wider text-[#a1a1aa] border-b border-[#27272a]">
-            <span>PR SENTINEL</span>
-            <MoreHorizontal className="w-3.5 h-3.5 cursor-pointer hover:text-white" />
-          </div>
-
-          <div className="p-3.5 space-y-4">
-            {/* PR Info Header */}
-            <div className="space-y-1">
-              <div className="flex items-center space-x-2">
-                {currentProvider === 'gitlab' ? (
-                  <span className="flex items-center gap-1 text-[11px] font-bold text-[#fc6d26] bg-[#fc6d26]/10 border border-[#fc6d26]/30 px-1.5 py-0.5 rounded">
-                    <GitLabIcon className="w-3 h-3" />
-                    GitLab MR !{scenario.pr.number}
-                  </span>
+      {/* Main Container */}
+      <main className="flex-1 flex flex-col p-4 max-w-7xl mx-auto w-full gap-4">
+        {/* PR Overview & Health Scorecard Banner */}
+        <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 shadow-lg flex flex-col gap-4">
+          <div className="flex items-start justify-between gap-4 flex-wrap">
+            <div className="flex items-start gap-3">
+              <div className="p-2.5 bg-slate-800 border border-slate-700 rounded-lg mt-0.5">
+                {scenario.pr.provider === 'gitlab' ? (
+                  <GitLabIcon className="w-6 h-6 text-orange-400" />
                 ) : (
-                  <span className="flex items-center gap-1 text-[11px] font-bold text-white bg-[#27272a] border border-[#3f3f46] px-1.5 py-0.5 rounded">
-                    <GitHubIcon className="w-3 h-3" />
-                    GitHub PR #{scenario.pr.number}
+                  <GitHubIcon className="w-6 h-6 text-slate-200" />
+                )}
+              </div>
+              <div>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="text-xs font-mono bg-slate-800 text-slate-300 px-2 py-0.5 rounded border border-slate-700">
+                    {scenario.pr.provider === 'gitlab' ? scenario.pr.projectPath : `${scenario.pr.owner}/${scenario.pr.repository}`}
                   </span>
-                )}
-                <span className="text-[10px] font-semibold bg-[#14532d] text-[#86efac] border border-[#22c55e]/40 px-1.5 py-0.2 rounded">
-                  Open
-                </span>
-                {scenario.pr.htmlUrl && (
-                  <a
-                    href={scenario.pr.htmlUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="text-[#38bdf8] hover:text-[#7dd3fc]"
-                    title={`Open on ${currentProvider === 'gitlab' ? 'GitLab' : 'GitHub'}`}
-                  >
-                    <ExternalLink className="w-3.5 h-3.5" />
-                  </a>
-                )}
-              </div>
-              <div className="text-[13px] font-semibold text-[#f4f4f5] leading-tight line-clamp-2">
-                {scenario.pr.title}
-              </div>
-              <div className="text-[11px] text-[#71717a] font-mono flex items-center gap-1">
-                <span className="truncate">{scenario.pr.branchName || 'feature'}</span>
-                <span>→</span>
-                <span>{scenario.pr.baseBranch || 'main'}</span>
+                  <span className="text-xs text-slate-400">&bull;</span>
+                  <span className="text-xs text-slate-400">
+                    Author: <span className="text-slate-200 font-medium">@{scenario.pr.author || 'developer'}</span>
+                  </span>
+                  <span className="text-xs text-slate-400">&bull;</span>
+                  <span className="text-xs text-slate-400 flex items-center gap-1 font-mono">
+                    <GitBranch className="w-3 h-3 text-slate-400" />
+                    {scenario.pr.branchName || 'feature'} &rarr; {scenario.pr.baseBranch || 'main'}
+                  </span>
+                </div>
+                <h1 className="text-lg font-bold text-white mt-1 flex items-center gap-2">
+                  <span>
+                    {scenario.pr.typeLabel || 'PR'} #{scenario.pr.number}: {scenario.pr.title}
+                  </span>
+                  {scenario.pr.htmlUrl && (
+                    <a
+                      href={scenario.pr.htmlUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-blue-400 hover:text-blue-300 inline-flex items-center text-xs"
+                      title="Open on GitHub/GitLab"
+                    >
+                      <ExternalLink className="w-3.5 h-3.5 ml-1" />
+                    </a>
+                  )}
+                </h1>
               </div>
             </div>
 
-            {/* Dynamic Metric Cards from AST Analysis */}
-            <div className="grid grid-cols-3 gap-2">
-              <div className="bg-[#202024] border border-[#2e2e34] rounded p-2 text-center">
-                <div className="text-base font-bold text-[#ef4444]">
-                  {analysisResult.metrics.breakingCount}
+            {/* Verdict Badge */}
+            <div className="flex items-center gap-2">
+              {reviewReport.verdict === 'APPROVE' && (
+                <div className="bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 px-3.5 py-1.5 rounded-lg flex items-center gap-2 font-bold text-sm shadow-sm">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                  <span>Approved &bull; Ready to Merge</span>
                 </div>
-                <div className="text-[10px] text-[#ef4444] font-medium">Breaking</div>
-              </div>
-              <div className="bg-[#202024] border border-[#2e2e34] rounded p-2 text-center">
-                <div className="text-base font-bold text-[#f97316]">
-                  {analysisResult.metrics.warningCount}
+              )}
+              {reviewReport.verdict === 'REQUEST_CHANGES' && (
+                <div className="bg-amber-500/10 border border-amber-500/30 text-amber-400 px-3.5 py-1.5 rounded-lg flex items-center gap-2 font-bold text-sm shadow-sm">
+                  <AlertTriangle className="w-4 h-4 text-amber-400" />
+                  <span>Changes Requested</span>
                 </div>
-                <div className="text-[10px] text-[#f97316] font-medium">Warnings</div>
-              </div>
-              <div className="bg-[#202024] border border-[#2e2e34] rounded p-2 text-center">
-                <div className="text-base font-bold text-[#22c55e]">
-                  {analysisResult.metrics.passedCount}
+              )}
+              {reviewReport.verdict === 'CRITICAL_RISK' && (
+                <div className="bg-rose-500/10 border border-rose-500/30 text-rose-400 px-3.5 py-1.5 rounded-lg flex items-center gap-2 font-bold text-sm shadow-sm">
+                  <XCircle className="w-4 h-4 text-rose-400" />
+                  <span>Critical Risk Blocked</span>
                 </div>
-                <div className="text-[10px] text-[#22c55e] font-medium">Passed</div>
-              </div>
-            </div>
-
-            {/* Deterministic Blast Radius Tree Trigger */}
-            <button
-              onClick={() => setActiveTab('blastRadius')}
-              className="w-full h-8 bg-[#202024] hover:bg-[#27272a] border border-[#2e2e34] rounded flex items-center justify-between px-2.5 text-xs text-[#d4d4d8] font-medium transition cursor-pointer"
-            >
-              <span className="flex items-center gap-2">
-                <Workflow className="w-3.5 h-3.5 text-[#38bdf8]" />
-                <span>Blast Radius Tree</span>
-              </span>
-              <span className="text-[10px] font-mono text-[#38bdf8] bg-[#38bdf8]/10 px-1.5 py-0.5 rounded">
-                AST
-              </span>
-            </button>
-
-            {/* DETERMINISTIC FINDINGS */}
-            <div className="space-y-1.5 pt-1">
-              <div className="flex items-center justify-between text-[11px] font-bold tracking-wider text-[#71717a]">
-                <span>AST FINDINGS</span>
-                <span className="w-4 h-4 rounded-full bg-[#ef4444]/20 text-[#ef4444] text-[10px] flex items-center justify-center font-bold">
-                  {analysisResult.findings.length}
-                </span>
-              </div>
-
-              {analysisResult.findings.length === 0 ? (
-                <div className="p-3 bg-[#202024] border border-[#2e2e34] rounded text-xs text-[#a1a1aa] text-center">
-                  No breaking contract violations found.
+              )}
+              {reviewReport.verdict === 'NEEDS_DISCUSSION' && (
+                <div className="bg-blue-500/10 border border-blue-500/30 text-blue-400 px-3.5 py-1.5 rounded-lg flex items-center gap-2 font-bold text-sm shadow-sm">
+                  <HelpCircle className="w-4 h-4 text-blue-400" />
+                  <span>Suggestions Available</span>
                 </div>
-              ) : (
-                analysisResult.findings.map((f) => (
-                  <div
-                    key={f.id}
-                    onClick={() => setSelectedFindingId(f.id)}
-                    className={`p-2.5 rounded border transition cursor-pointer ${
-                      selectedFinding?.id === f.id
-                        ? 'bg-[#27272a] border-[#ef4444]/60 ring-1 ring-[#ef4444]/30'
-                        : 'bg-[#202024] border-[#2e2e34] hover:bg-[#27272a]'
-                    }`}
-                  >
-                    <div className="flex items-start space-x-2">
-                      <span
-                        className={`w-2 h-2 rounded-full mt-1 shrink-0 ${
-                          f.severity === 'high' ? 'bg-[#ef4444]' : 'bg-[#f97316]'
-                        }`}
-                      />
-                      <div className="min-w-0 flex-1">
-                        <div className="text-xs font-semibold text-white truncate">{f.title}</div>
-                        <div className="text-[11px] text-[#71717a] font-mono truncate">{f.filePath}</div>
-                        <div className="text-[10px] text-[#a1a1aa] mt-0.5">
-                          {f.affectedConsumersCount} impacted consumer(s)
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                ))
               )}
             </div>
+          </div>
 
-            {/* CHANGED FILES IN PR */}
-            <div className="space-y-1.5 pt-1">
-              <div className="flex items-center justify-between text-[11px] font-bold tracking-wider text-[#71717a]">
-                <span>FILES CHANGED</span>
-                <span className="text-[11px] text-[#71717a]">{scenario.changedFiles.length}</span>
+          {/* Dimensional Scorecard Grid */}
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5 pt-2 border-t border-slate-800">
+            <div className="bg-slate-950/60 border border-slate-800 rounded-lg p-2.5 text-center">
+              <div className="text-xl font-extrabold text-blue-400">{reviewReport.overallScore}/100</div>
+              <div className="text-[10px] text-slate-400 font-semibold uppercase tracking-wider mt-0.5">Overall Health</div>
+            </div>
+            <div className="bg-slate-950/60 border border-slate-800 rounded-lg p-2.5 text-center">
+              <div className={`text-xl font-extrabold ${reviewReport.breakdown.architectureScore >= 80 ? 'text-emerald-400' : 'text-amber-400'}`}>
+                {reviewReport.breakdown.architectureScore}/100
               </div>
-              <div className="space-y-1 text-xs font-mono max-h-48 overflow-y-auto">
-                {scenario.changedFiles.map((file) => (
-                  <div
-                    key={file.filename}
-                    onClick={() => {
-                      setSelectedConsumerFile(file.filename);
-                      setActiveTab('diff');
-                    }}
-                    className={`flex items-center justify-between px-2 py-1.5 rounded cursor-pointer ${
-                      activeDiffFile.filename === file.filename ? 'bg-[#27272a] text-white' : 'text-[#a1a1aa] hover:bg-[#202024]'
+              <div className="text-[10px] text-slate-400 font-semibold uppercase tracking-wider mt-0.5">Architecture</div>
+            </div>
+            <div className="bg-slate-950/60 border border-slate-800 rounded-lg p-2.5 text-center">
+              <div className={`text-xl font-extrabold ${reviewReport.breakdown.securityScore >= 90 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                {reviewReport.breakdown.securityScore}/100
+              </div>
+              <div className="text-[10px] text-slate-400 font-semibold uppercase tracking-wider mt-0.5">Security</div>
+            </div>
+            <div className="bg-slate-950/60 border border-slate-800 rounded-lg p-2.5 text-center">
+              <div className={`text-xl font-extrabold ${reviewReport.breakdown.performanceScore >= 80 ? 'text-emerald-400' : 'text-amber-400'}`}>
+                {reviewReport.breakdown.performanceScore}/100
+              </div>
+              <div className="text-[10px] text-slate-400 font-semibold uppercase tracking-wider mt-0.5">Performance</div>
+            </div>
+            <div className="bg-slate-950/60 border border-slate-800 rounded-lg p-2.5 text-center">
+              <div className={`text-xl font-extrabold ${reviewReport.breakdown.resilienceScore >= 80 ? 'text-emerald-400' : 'text-amber-400'}`}>
+                {reviewReport.breakdown.resilienceScore}/100
+              </div>
+              <div className="text-[10px] text-slate-400 font-semibold uppercase tracking-wider mt-0.5">Resilience</div>
+            </div>
+            <div className="bg-slate-950/60 border border-slate-800 rounded-lg p-2.5 text-center">
+              <div className={`text-xl font-extrabold ${reviewReport.breakdown.compatibilityScore >= 90 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                {reviewReport.breakdown.compatibilityScore}/100
+              </div>
+              <div className="text-[10px] text-slate-400 font-semibold uppercase tracking-wider mt-0.5">AST Compatibility</div>
+            </div>
+          </div>
+        </div>
+
+        {/* View Switcher Tabs */}
+        <div className="flex items-center justify-between border-b border-slate-800 pb-1 flex-wrap gap-2">
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setMainView('reviewer')}
+              className={`flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-semibold transition-all ${
+                mainView === 'reviewer'
+                  ? 'bg-blue-600 text-white shadow-sm'
+                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+              }`}
+            >
+              <Sparkles className="w-3.5 h-3.5" />
+              <span>Senior Code Review & Fixes</span>
+              <span className="bg-black/30 px-1.5 py-0.2 rounded-full text-[10px]">
+                {reviewReport.items.length}
+              </span>
+            </button>
+
+            <button
+              onClick={() => setMainView('blastRadius')}
+              className={`flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-semibold transition-all ${
+                mainView === 'blastRadius'
+                  ? 'bg-blue-600 text-white shadow-sm'
+                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+              }`}
+            >
+              <Workflow className="w-3.5 h-3.5" />
+              <span>AST Blast Radius Impact</span>
+              <span className="bg-black/30 px-1.5 py-0.2 rounded-full text-[10px]">
+                {analysisResult.findings.length}
+              </span>
+            </button>
+
+            <button
+              onClick={() => setMainView('diff')}
+              className={`flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-semibold transition-all ${
+                mainView === 'diff'
+                  ? 'bg-blue-600 text-white shadow-sm'
+                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+              }`}
+            >
+              <FileDiff className="w-3.5 h-3.5" />
+              <span>Changed Files & Diffs</span>
+              <span className="bg-black/30 px-1.5 py-0.2 rounded-full text-[10px]">
+                {scenario.changedFiles.length}
+              </span>
+            </button>
+
+            <button
+              onClick={() => {
+                setMainView('repoLinker');
+                handleFetchOpenPRsForRepo();
+              }}
+              className={`flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-semibold transition-all ${
+                mainView === 'repoLinker'
+                  ? 'bg-blue-600 text-white shadow-sm'
+                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+              }`}
+            >
+              <FolderGit2 className="w-3.5 h-3.5" />
+              <span>Workspace Repo Linker</span>
+            </button>
+          </div>
+
+          {/* Quick Copy Markdown Review */}
+          <button
+            onClick={handleCopyReviewMarkdown}
+            className="flex items-center gap-1.5 text-xs text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg border border-slate-700 transition-colors"
+          >
+            {copiedReview ? <CheckCheck className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+            <span>{copiedReview ? 'Copied to Clipboard!' : 'Copy Review Markdown'}</span>
+          </button>
+        </div>
+
+        {/* View 1: Senior Code Review & Best Replacements ("Good vs Bad Fixes") */}
+        {mainView === 'reviewer' && (
+          <div className="flex flex-col gap-4">
+            {/* Category and Severity Filter Chips */}
+            <div className="flex items-center justify-between gap-3 flex-wrap bg-slate-900/60 border border-slate-800 rounded-lg p-2.5">
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <span className="text-xs text-slate-400 font-medium flex items-center gap-1 mr-1">
+                  <Filter className="w-3 h-3 text-slate-500" /> Filter Category:
+                </span>
+                {['all', 'breaking-changes', 'security', 'performance', 'edge-cases', 'type-safety', 'code-quality'].map((cat) => (
+                  <button
+                    key={cat}
+                    onClick={() => setSelectedCategory(cat)}
+                    className={`text-xs px-2.5 py-1 rounded-md transition-colors capitalize font-medium ${
+                      selectedCategory === cat
+                        ? 'bg-blue-600 text-white'
+                        : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
                     }`}
                   >
-                    <span className="flex items-center gap-1.5 truncate">
-                      <FileDiff className="w-3.5 h-3.5 text-[#38bdf8]" />
-                      <span className="truncate">{file.filename}</span>
-                    </span>
-                    <span className="text-[10px] text-[#22c55e] font-bold">+{file.additions}</span>
-                  </div>
+                    {cat.replace('-', ' ')}
+                  </button>
+                ))}
+              </div>
+
+              <div className="flex items-center gap-1.5">
+                <span className="text-xs text-slate-400 font-medium mr-1">Severity:</span>
+                {['all', 'critical', 'high', 'medium', 'low'].map((sev) => (
+                  <button
+                    key={sev}
+                    onClick={() => setSelectedSeverity(sev)}
+                    className={`text-xs px-2 py-0.5 rounded transition-colors uppercase font-mono text-[11px] ${
+                      selectedSeverity === sev
+                        ? 'bg-slate-700 text-white font-bold'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    {sev}
+                  </button>
                 ))}
               </div>
             </div>
 
-            {/* Re-analyze Button */}
-            <div className="pt-2">
-              <button
-                onClick={handleReanalyze}
-                disabled={isReanalyzing}
-                className="w-full h-8 bg-[#202024] hover:bg-[#27272a] border border-[#2e2e34] rounded flex items-center justify-center gap-2 text-xs text-[#d4d4d8] font-medium transition cursor-pointer"
-              >
-                <RefreshCw className={`w-3.5 h-3.5 ${isReanalyzing ? 'animate-spin text-[#38bdf8]' : ''}`} />
-                <span>{isReanalyzing ? 'Running AST Reference Scanner...' : 'Re-run AST Pipeline'}</span>
-              </button>
-            </div>
-          </div>
-        </aside>
-
-        {/* Center Editor Pane */}
-        <main className="flex-1 flex flex-col min-w-0 bg-[#141416] overflow-hidden">
-          {/* Editor Tabs Bar */}
-          <div className="h-9 bg-[#18181b] border-b border-[#27272a] flex items-center overflow-x-auto shrink-0">
-            <div
-              onClick={() => setActiveTab('diff')}
-              className={`h-full px-4 border-r border-[#27272a] flex items-center space-x-2 text-xs cursor-pointer ${
-                activeTab === 'diff'
-                  ? 'bg-[#141416] text-white border-t-2 border-t-[#0284c7]'
-                  : 'bg-[#18181b] text-[#71717a] hover:text-[#cccccc]'
-              }`}
-            >
-              <FileDiff className="w-3.5 h-3.5 text-[#38bdf8]" />
-              <span>{activeDiffFile.filename} (PR Diff)</span>
-              <X className="w-3 h-3 text-[#71717a] hover:text-white" />
-            </div>
-
-            <div
-              onClick={() => setActiveTab('consumer')}
-              className={`h-full px-4 border-r border-[#27272a] flex items-center space-x-2 text-xs cursor-pointer ${
-                activeTab === 'consumer'
-                  ? 'bg-[#141416] text-white border-t-2 border-t-[#0284c7]'
-                  : 'bg-[#18181b] text-[#71717a] hover:text-[#cccccc]'
-              }`}
-            >
-              <span className="text-[#38bdf8] font-mono text-[11px]">⚛</span>
-              <span>{selectedConsumerFile}</span>
-            </div>
-
-            <div
-              onClick={() => setActiveTab('blastRadius')}
-              className={`h-full px-4 border-r border-[#27272a] flex items-center space-x-2 text-xs cursor-pointer ${
-                activeTab === 'blastRadius'
-                  ? 'bg-[#141416] text-white border-t-2 border-t-[#0284c7]'
-                  : 'bg-[#18181b] text-[#71717a] hover:text-[#cccccc]'
-              }`}
-            >
-              <Workflow className="w-3.5 h-3.5 text-[#38bdf8]" />
-              <span>Blast Radius AST Graph</span>
-            </div>
-          </div>
-
-          {/* Main Code Diff & Consumer Code View */}
-          <div className="flex-1 overflow-y-auto p-4 space-y-4">
-            {activeTab === 'blastRadius' ? (
-              /* Deterministic Blast Radius Pipeline Tree */
-              <div className="bg-[#18181b] border border-[#27272a] rounded-lg p-6 space-y-6">
-                <div className="flex items-center justify-between border-b border-[#27272a] pb-4">
-                  <div>
-                    <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                      <Workflow className="w-4 h-4 text-[#38bdf8]" />
-                      Deterministic Blast Radius AST Graph
-                    </h3>
-                    <p className="text-xs text-[#a1a1aa] mt-1">
-                      Pure TypeScript Compiler API Symbol Scanner &amp; Reference Discovery Engine.
-                    </p>
-                  </div>
-                  <span className="text-[11px] px-2 py-0.5 rounded bg-[#38bdf8]/10 text-[#38bdf8] border border-[#38bdf8]/30 font-mono">
-                    PR Diff → TypeScript AST → Consumer References → Scoped Evidence
-                  </span>
+            {/* List of Review Findings with Side-by-Side Good vs Bad Fixes */}
+            {filteredReviewItems.length === 0 ? (
+              <div className="bg-slate-900 border border-slate-800 rounded-xl p-12 text-center flex flex-col items-center justify-center">
+                <div className="w-12 h-12 rounded-full bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center text-emerald-400 mb-3">
+                  <CheckCircle2 className="w-6 h-6" />
                 </div>
-
-                {analysisResult.blastRadius.length === 0 ? (
-                  <div className="p-8 text-center text-xs text-[#71717a]">
-                    No changed symbol nodes found in this PR.
-                  </div>
-                ) : (
-                  analysisResult.blastRadius.map((node, nIdx) => (
-                    <div key={nIdx} className="flex flex-col items-center space-y-4 py-2 font-mono text-xs">
-                      {/* Symbol definition node */}
-                      <div className="p-3.5 bg-[#1e293b] border border-[#38bdf8]/40 rounded-lg text-center shadow-lg w-80">
-                        <div className="text-[10px] text-[#38bdf8] font-bold uppercase tracking-wider">
-                          1. Changed Symbol (AST {node.symbol.kind})
-                        </div>
-                        <div className="text-sm font-bold text-white mt-1">{node.symbol.name}</div>
-                        <div className="text-[11px] text-[#94a3b8] mt-0.5">{node.symbol.filePath}</div>
-                        {node.symbol.removedMembers && (
-                          <div className="mt-2 flex items-center justify-center gap-2 text-[11px]">
-                            <span className="px-1.5 py-0.5 rounded bg-red-950/80 text-red-300 border border-red-800/50">
-                              - {node.symbol.removedMembers.map((m) => `'${m}'`).join(', ')}
-                            </span>
-                            <span className="text-zinc-500">→</span>
-                            <span className="px-1.5 py-0.5 rounded bg-emerald-950/80 text-emerald-300 border border-emerald-800/50">
-                              + {node.symbol.addedMembers?.map((m) => `'${m}'`).join(', ')}
-                            </span>
-                          </div>
-                        )}
-                      </div>
-
-                      <div className="w-0.5 h-6 bg-[#38bdf8]/40" />
-
-                      {/* AST Reference Scanner */}
-                      <div className="p-2.5 bg-[#202024] border border-[#2e2e34] rounded text-center text-xs text-[#d4d4d8] w-72">
-                        <div className="text-[10px] text-[#a1a1aa] uppercase font-bold">2. AST Reference Scanner</div>
-                        <div>Found {node.consumers.length} Project Consumer Call-sites</div>
-                      </div>
-
-                      {/* Consumer Branches */}
-                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 w-full max-w-2xl pt-2">
-                        {node.consumers.map((consumer: ConsumerReference, cIdx: number) => {
-                          const isHigh = consumer.checksValue !== undefined;
-                          return (
-                            <div
-                              key={cIdx}
-                              onClick={() => handleOpenConsumer(consumer.consumerFilePath, consumer.line)}
-                              className={`p-3.5 bg-[#202024] rounded-lg cursor-pointer transition shadow-md border-2 ${
-                                isHigh
-                                  ? 'border-[#ef4444]/60 hover:border-[#ef4444]'
-                                  : 'border-[#f97316]/60 hover:border-[#f97316]'
-                              }`}
-                            >
-                              <div className="flex items-center justify-between">
-                                <span className="text-xs font-bold text-white truncate">
-                                  {consumer.consumerFilePath}:{consumer.line}
-                                </span>
-                                <span
-                                  className={`text-[10px] font-bold px-1.5 py-0.5 rounded border ${
-                                    isHigh
-                                      ? 'bg-[#ef4444]/20 text-[#ef4444] border-[#ef4444]/40'
-                                      : 'bg-[#f97316]/20 text-[#f97316] border-[#f97316]/40'
-                                  }`}
-                                >
-                                  {isHigh ? '🔴 BREAKING' : '🟠 WARNING'}
-                                </span>
-                              </div>
-                              <div className="text-[11px] text-[#a1a1aa] mt-2 font-mono bg-[#141416] p-1.5 rounded border border-[#27272a] truncate">
-                                {consumer.snippet}
-                              </div>
-                              <div className="mt-2 text-[11px] text-[#ef4444] leading-tight">
-                                {consumer.checksValue
-                                  ? `Strict comparison against removed variant '${consumer.checksValue}'`
-                                  : `References modified symbol '${consumer.targetSymbolName}'`}
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  ))
-                )}
-              </div>
-            ) : activeTab === 'diff' ? (
-              /* Raw Git Diff Patch Display */
-              <div className="bg-[#18181b] border border-[#27272a] rounded overflow-hidden shadow-md">
-                <div className="px-3.5 py-2 bg-[#202024] border-b border-[#27272a] text-xs font-mono text-[#a1a1aa] flex items-center justify-between">
-                  <span>{activeDiffFile.filename}</span>
-                  <span className="text-[11px] text-[#71717a]">Unified PR Diff</span>
-                </div>
-                <pre className="p-4 font-mono text-xs text-[#d4d4d8] leading-relaxed overflow-x-auto whitespace-pre-wrap">
-                  {activeDiffFile.patch || 'No patch text available for this file.'}
-                </pre>
+                <h3 className="text-base font-bold text-white mb-1">Zero Actionable Code Smells or Vulnerabilities</h3>
+                <p className="text-xs text-slate-400 max-w-md">
+                  All analyzed files in this PR comply with senior engineering standards, type safety, and AST backward compatibility.
+                </p>
               </div>
             ) : (
-              /* Dynamic Consumer File AST Inspector */
-              <div className="bg-[#18181b] border border-[#27272a] rounded overflow-hidden shadow-md">
-                <div className="px-3.5 py-2 bg-[#202024] border-b border-[#27272a] text-xs font-mono text-[#a1a1aa] flex items-center justify-between">
-                  <div className="flex items-center space-x-2">
-                    <span className="text-[#38bdf8]">⚛</span>
-                    <span className="text-white font-semibold">{selectedConsumerFile}</span>
-                  </div>
-                  <span className="text-[11px] text-[#ef4444]">Target Line: {highlightedLine}</span>
-                </div>
+              <div className="flex flex-col gap-4">
+                {filteredReviewItems.map((item, idx) => {
+                  const isApplied = appliedFixes[item.id];
+                  return (
+                    <div
+                      key={item.id}
+                      className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden shadow-md transition-all hover:border-slate-700"
+                    >
+                      {/* Review Card Header */}
+                      <div className="p-3.5 bg-slate-800/40 border-b border-slate-800 flex items-center justify-between gap-3 flex-wrap">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span
+                            className={`text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded border ${
+                              item.severity === 'critical'
+                                ? 'bg-rose-500/15 text-rose-400 border-rose-500/30'
+                                : item.severity === 'high'
+                                ? 'bg-rose-500/10 text-rose-400 border-rose-500/20'
+                                : item.severity === 'medium'
+                                ? 'bg-amber-500/15 text-amber-400 border-amber-500/30'
+                                : 'bg-blue-500/15 text-blue-400 border-blue-500/30'
+                            }`}
+                          >
+                            {item.severity}
+                          </span>
+                          <span className="text-xs font-bold text-white">
+                            {idx + 1}. {item.title}
+                          </span>
+                          <span className="text-[11px] font-mono bg-slate-800 text-slate-400 px-1.5 py-0.5 rounded">
+                            {item.ruleId}
+                          </span>
+                        </div>
 
-                <div className="p-3 font-mono text-[13px] leading-relaxed">
-                  {activeConsumerContent.split('\n').map((lineText, idx) => {
-                    const lineNum = idx + 1;
-                    const isTarget = lineNum === highlightedLine;
+                        <div className="flex items-center gap-2">
+                          <button
+                            onClick={() => handleOpenConsumer(item.file, item.line)}
+                            className="text-xs font-mono text-blue-400 hover:text-blue-300 underline flex items-center gap-1"
+                          >
+                            <span>{item.file}:{item.line}</span>
+                            <ExternalLink className="w-3 h-3" />
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* Critique Body */}
+                      <div className="p-4 flex flex-col gap-3">
+                        <div className="text-xs text-slate-300 leading-relaxed bg-slate-950/40 p-3 rounded-lg border border-slate-800/60">
+                          <strong className="text-slate-200 block mb-1 text-xs">Senior Staff Critique:</strong>
+                          {item.critique}
+                        </div>
+
+                        {item.codeSnippet && (
+                          <div>
+                            <span className="text-[11px] text-slate-400 font-semibold block mb-1">
+                              CURRENT PR CODE IN FILE:
+                            </span>
+                            <pre className="text-xs font-mono bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-slate-200 overflow-x-auto">
+                              {item.codeSnippet}
+                            </pre>
+                          </div>
+                        )}
+
+                        {/* Side-by-Side Good vs Bad Fix Comparison */}
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-1">
+                          {/* Bad Fix Box */}
+                          <div className="bg-rose-950/15 border border-rose-500/25 rounded-lg p-3 flex flex-col justify-between">
+                            <div>
+                              <div className="flex items-center justify-between text-xs font-bold text-rose-400 uppercase tracking-wider mb-1.5">
+                                <span className="flex items-center gap-1.5">
+                                  <XCircle className="w-3.5 h-3.5 text-rose-400" />
+                                  ❌ Suboptimal / Bad Fix (Avoid)
+                                </span>
+                              </div>
+                              <pre className="text-xs font-mono bg-slate-950/80 border border-rose-500/20 rounded p-2.5 text-rose-200/90 overflow-x-auto whitespace-pre-wrap">
+                                {item.fixComparison.badFixSnippet}
+                              </pre>
+                            </div>
+                            <div className="text-xs text-slate-400 mt-2.5 pt-2 border-t border-rose-500/20">
+                              <strong className="text-rose-300">Why it fails: </strong>
+                              {item.fixComparison.badFixWhy}
+                            </div>
+                          </div>
+
+                          {/* Good Fix Box */}
+                          <div className="bg-emerald-950/15 border border-emerald-500/25 rounded-lg p-3 flex flex-col justify-between">
+                            <div>
+                              <div className="flex items-center justify-between text-xs font-bold text-emerald-400 uppercase tracking-wider mb-1.5">
+                                <span className="flex items-center gap-1.5">
+                                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                                  ✅ Recommended Best Replacement
+                                </span>
+                                <button
+                                  onClick={() => handleApplyFix(item.id)}
+                                  className={`text-[11px] px-2.5 py-1 rounded font-semibold transition-all flex items-center gap-1 ${
+                                    isApplied
+                                      ? 'bg-emerald-600 text-white'
+                                      : 'bg-emerald-500 hover:bg-emerald-400 text-slate-950'
+                                  }`}
+                                >
+                                  {isApplied ? (
+                                    <>
+                                      <Check className="w-3 h-3" />
+                                      <span>Applied!</span>
+                                    </>
+                                  ) : (
+                                    <>
+                                      <Zap className="w-3 h-3" />
+                                      <span>Apply Fix</span>
+                                    </>
+                                  )}
+                                </button>
+                              </div>
+                              <pre className="text-xs font-mono bg-slate-950/80 border border-emerald-500/20 rounded p-2.5 text-emerald-200/90 overflow-x-auto whitespace-pre-wrap">
+                                {item.fixComparison.goodFixSnippet}
+                              </pre>
+                            </div>
+                            <div className="text-xs text-slate-400 mt-2.5 pt-2 border-t border-emerald-500/20">
+                              <strong className="text-emerald-300">Why it is optimal: </strong>
+                              {item.fixComparison.goodFixWhy}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* View 2: AST Blast Radius Impact */}
+        {mainView === 'blastRadius' && (
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+            <div className="lg:col-span-1 bg-slate-900 border border-slate-800 rounded-xl p-4 flex flex-col gap-3">
+              <h2 className="text-sm font-bold text-white flex items-center justify-between">
+                <span>Detected AST Findings ({analysisResult.findings.length})</span>
+                <span className="text-xs font-normal text-slate-400">AST Hard Evidence</span>
+              </h2>
+
+              {analysisResult.findings.length === 0 ? (
+                <div className="p-6 text-center text-slate-400 text-xs">
+                  Zero breaking AST signature changes detected in this PR.
+                </div>
+              ) : (
+                <div className="flex flex-col gap-2">
+                  {analysisResult.findings.map((finding) => {
+                    const isSelected = selectedFinding?.id === finding.id;
                     return (
                       <div
-                        key={idx}
-                        className={`flex items-center px-1 -mx-1 ${
-                          isTarget ? 'bg-[#450a0a]/50 text-[#fca5a5] border-l-2 border-[#ef4444]' : ''
+                        key={finding.id}
+                        onClick={() => setSelectedFindingId(finding.id)}
+                        className={`p-3 rounded-lg border transition-all cursor-pointer ${
+                          isSelected
+                            ? 'bg-slate-800 border-blue-500 shadow-sm'
+                            : 'bg-slate-950/60 border-slate-800/80 hover:border-slate-700'
                         }`}
                       >
-                        <div className="w-4 flex justify-center select-none">
-                          {isTarget && <span className="w-2 h-2 rounded-full bg-[#ef4444] animate-pulse" />}
+                        <div className="flex items-center justify-between mb-1">
+                          <span className="text-[10px] uppercase font-bold px-1.5 py-0.5 rounded bg-rose-500/20 text-rose-400 border border-rose-500/30">
+                            {finding.severity}
+                          </span>
+                          <span className="text-[11px] text-slate-400 font-mono">
+                            {finding.affectedConsumersCount} consumer site(s)
+                          </span>
                         </div>
-                        <span
-                          className={`w-8 text-right pr-4 select-none ${
-                            isTarget ? 'text-[#fca5a5] font-bold' : 'text-[#52525b]'
-                          }`}
-                        >
-                          {lineNum}
-                        </span>
-                        <span className={isTarget ? 'font-semibold text-white' : 'text-[#d4d4d8]'}>
-                          {lineText || ' '}
-                        </span>
+                        <div className="text-xs font-semibold text-white truncate">{finding.title}</div>
+                        <div className="text-[11px] text-slate-400 truncate mt-0.5 font-mono">{finding.filePath}</div>
                       </div>
                     );
                   })}
                 </div>
-              </div>
-            )}
-          </div>
-        </main>
+              )}
+            </div>
 
-        {/* Right Sidebar: PR Sentinel Findings Panel */}
-        <aside className="w-80 md:w-96 bg-[#18181b] border-l border-[#27272a] flex flex-col shrink-0 overflow-y-auto">
-          {/* Header */}
-          <div className="h-9 px-4 flex items-center justify-between text-[11px] font-bold uppercase tracking-wider text-[#a1a1aa] border-b border-[#27272a]">
-            <span>PR SENTINEL</span>
-            <div className="flex items-center space-x-3 text-[#71717a]">
-              <Sun className="w-3.5 h-3.5 hover:text-white cursor-pointer" />
-              <MoreHorizontal className="w-3.5 h-3.5 hover:text-white cursor-pointer" />
-              <X className="w-3.5 h-3.5 hover:text-white cursor-pointer" />
+            {/* Finding Detail */}
+            <div className="lg:col-span-2 bg-slate-900 border border-slate-800 rounded-xl p-5 flex flex-col gap-4">
+              {selectedFinding ? (
+                <>
+                  <div className="border-b border-slate-800 pb-3">
+                    <div className="flex items-center justify-between">
+                      <h3 className="text-base font-bold text-white">{selectedFinding.title}</h3>
+                      <span className="text-xs font-mono bg-slate-800 text-slate-300 px-2 py-0.5 rounded">
+                        {selectedFinding.filePath}
+                      </span>
+                    </div>
+                    <p className="text-xs text-slate-300 mt-2 leading-relaxed">{selectedFinding.explanation}</p>
+                  </div>
+
+                  {/* Consumers List */}
+                  <div>
+                    <h4 className="text-xs font-bold text-slate-300 uppercase tracking-wider mb-2">
+                      Affected Consumer Call Sites ({selectedFinding.evidence.length})
+                    </h4>
+                    <div className="flex flex-col gap-2">
+                      {selectedFinding.evidence.map((ev, i) => (
+                        <div
+                          key={i}
+                          onClick={() => handleOpenConsumer(ev.file, ev.line)}
+                          className="bg-slate-950 border border-slate-800/80 hover:border-blue-500/60 rounded-lg p-2.5 transition-colors cursor-pointer flex items-center justify-between gap-3"
+                        >
+                          <div>
+                            <div className="text-xs font-mono text-blue-400 font-medium">{ev.file}:{ev.line}</div>
+                            <div className="text-xs text-slate-300 mt-0.5">{ev.description}</div>
+                          </div>
+                          <div className="text-xs text-slate-500 font-mono bg-slate-900 px-2 py-1 rounded">
+                            {ev.snippet}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="bg-blue-950/20 border border-blue-500/30 rounded-lg p-3 text-xs text-blue-200">
+                    <strong className="block text-blue-300 mb-1">Sentinel Recommendation:</strong>
+                    {selectedFinding.recommendation}
+                  </div>
+                </>
+              ) : (
+                <div className="p-8 text-center text-slate-400 text-xs">Select a finding to inspect blast radius.</div>
+              )}
             </div>
           </div>
+        )}
 
-          {selectedFinding ? (
-            <div className="p-4 space-y-4">
-              {/* Severity Pill */}
-              <div>
-                <span
-                  className={`text-[10px] font-bold tracking-wider uppercase px-2 py-0.5 rounded-full border ${
-                    selectedFinding.severity === 'high'
-                      ? 'bg-[#ef4444]/20 text-[#ef4444] border-[#ef4444]/35'
-                      : 'bg-[#f97316]/20 text-[#f97316] border-[#f97316]/35'
+        {/* View 3: Changed Files & Diffs */}
+        {mainView === 'diff' && (
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+            <div className="lg:col-span-1 bg-slate-900 border border-slate-800 rounded-xl p-4 flex flex-col gap-2">
+              <h2 className="text-xs font-bold uppercase tracking-wider text-slate-400 mb-1">
+                Modified Files ({scenario.changedFiles.length})
+              </h2>
+              {scenario.changedFiles.map((file) => (
+                <div
+                  key={file.filename}
+                  onClick={() => setSelectedConsumerFile(file.filename)}
+                  className={`p-2.5 rounded-lg border text-xs cursor-pointer transition-colors flex items-center justify-between ${
+                    selectedConsumerFile === file.filename
+                      ? 'bg-slate-800 border-blue-500 text-white'
+                      : 'bg-slate-950/60 border-slate-800 text-slate-300 hover:border-slate-700'
                   }`}
                 >
-                  {selectedFinding.severity === 'high' ? 'BREAKING CHANGE' : 'WARNING'}
-                </span>
+                  <span className="font-mono truncate">{file.filename}</span>
+                  <div className="flex items-center gap-1.5 font-mono text-[11px]">
+                    <span className="text-emerald-400">+{file.additions}</span>
+                    <span className="text-rose-400">-{file.deletions}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="lg:col-span-2 bg-slate-900 border border-slate-800 rounded-xl p-4 flex flex-col gap-2">
+              <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+                <span className="text-xs font-mono text-slate-200">{selectedConsumerFile}</span>
+                <span className="text-xs text-slate-400">Target Line: {highlightedLine}</span>
+              </div>
+              <pre className="text-xs font-mono bg-slate-950 border border-slate-800/80 rounded-lg p-4 overflow-x-auto text-slate-300 whitespace-pre-wrap leading-relaxed">
+                {scenario.changedFiles.find((f) => f.filename === selectedConsumerFile)?.patch ||
+                  scenario.workspaceFiles.find((f) => f.path === selectedConsumerFile)?.content ||
+                  '// No file content available for preview.'}
+              </pre>
+            </div>
+          </div>
+        )}
+
+        {/* View 4: Workspace Repository Linker */}
+        {mainView === 'repoLinker' && (
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 flex flex-col gap-4">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3 flex-wrap gap-2">
+              <div>
+                <h2 className="text-base font-bold text-white flex items-center gap-2">
+                  <FolderGit2 className="w-5 h-5 text-blue-400" />
+                  <span>Linked Repository: {detectedTarget.target?.owner}/{detectedTarget.target?.repo}</span>
+                </h2>
+                <p className="text-xs text-slate-400 mt-1">
+                  PR Sentinel seamlessly binds with your local opened workspace git remote to pull and review pull requests.
+                </p>
               </div>
 
-              {/* Title & Subtitle */}
-              <div className="space-y-0.5">
-                <h2 className="text-base font-bold text-white">{selectedFinding.title}</h2>
-                <div className="text-xs text-[#71717a] font-mono">{selectedFinding.filePath}</div>
-              </div>
+              <button
+                onClick={handleFetchOpenPRsForRepo}
+                disabled={isLoadingPRs}
+                className="bg-blue-600 hover:bg-blue-500 text-white text-xs px-3.5 py-1.5 rounded-lg font-medium transition-colors flex items-center gap-1.5"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isLoadingPRs ? 'animate-spin' : ''}`} />
+                <span>Refresh Open PRs List</span>
+              </button>
+            </div>
 
-              {/* Transition Pills */}
-              {selectedFinding.oldValue && selectedFinding.newValue && (
-                <div className="flex items-center space-x-2 font-mono text-xs">
-                  <span className="px-2.5 py-1 rounded bg-[#ef4444]/15 text-[#fca5a5] border border-[#ef4444]/30">
-                    {selectedFinding.oldValue}
-                  </span>
-                  <span className="text-[#71717a]">→</span>
-                  <span className="px-2.5 py-1 rounded bg-[#22c55e]/15 text-[#86efac] border border-[#22c55e]/30">
-                    {selectedFinding.newValue}
-                  </span>
-                </div>
-              )}
+            {/* Open PRs list */}
+            <div>
+              <h3 className="text-xs font-bold text-slate-300 uppercase tracking-wider mb-2">
+                Available Open PRs / MRs in Repository:
+              </h3>
 
-              {/* DETERMINISTIC IMPACT SECTION */}
-              <div className="space-y-2 pt-2 border-t border-[#27272a]">
-                <div className="text-[11px] font-bold uppercase tracking-wider text-[#a1a1aa]">
-                  IMPACTED CONSUMERS
+              {isLoadingPRs ? (
+                <div className="p-8 text-center text-slate-400 text-xs">
+                  <RefreshCw className="w-5 h-5 animate-spin mx-auto mb-2 text-blue-400" />
+                  Fetching open pull requests...
                 </div>
-                <div className="text-xs text-[#71717a]">
-                  Affects {selectedFinding.affectedConsumersCount} workspace consumer(s)
+              ) : openPRsList.length === 0 ? (
+                <div className="bg-slate-950/60 border border-slate-800 rounded-lg p-6 text-center text-slate-400 text-xs">
+                  Click <strong>Refresh Open PRs List</strong> to query live PRs from GitHub/GitLab or select one of the built-in test scenarios.
                 </div>
-
-                {/* Evidence Items */}
-                <div className="space-y-2">
-                  {selectedFinding.evidence.map((ev, idx) => (
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  {openPRsList.map((pr) => (
                     <div
-                      key={idx}
-                      onClick={() => handleOpenConsumer(ev.file, ev.line)}
-                      className="p-2.5 bg-[#202024] hover:bg-[#27272a] border border-[#2e2e34] rounded transition cursor-pointer"
+                      key={pr.number}
+                      onClick={() => handleFetchRemotePrOrMr(pr.number)}
+                      className="bg-slate-950 border border-slate-800 hover:border-blue-500 rounded-lg p-3 cursor-pointer transition-all flex flex-col justify-between gap-2"
                     >
-                      <div className="flex items-center space-x-1.5 text-xs font-semibold text-white">
-                        <span className={ev.severity === 'high' ? 'text-[#ef4444]' : 'text-[#f97316]'}>
-                          {ev.severity === 'high' ? '🔴' : '🟠'}
-                        </span>
-                        <span>
-                          {ev.file}:{ev.line}
-                        </span>
+                      <div>
+                        <div className="flex items-center justify-between text-xs font-bold text-white mb-1">
+                          <span>{pr.typeLabel || 'PR'} #{pr.number}: {pr.title}</span>
+                          <span className="text-[10px] font-mono bg-blue-500/20 text-blue-300 px-1.5 py-0.5 rounded">
+                            {pr.branchName}
+                          </span>
+                        </div>
+                        <div className="text-[11px] text-slate-400">
+                          Author: @{pr.author} &bull; Updated: {pr.updatedAt?.slice(0, 10) || 'recently'}
+                        </div>
                       </div>
-                      <div className="mt-1.5">
-                        <span className="text-[11px] font-mono px-1.5 py-0.5 rounded bg-[#141416] text-[#e4e4e7] border border-[#27272a]">
-                          {ev.snippet}
+                      <div className="text-right">
+                        <span className="text-xs text-blue-400 font-semibold hover:underline">
+                          Run Review &rarr;
                         </span>
                       </div>
                     </div>
                   ))}
                 </div>
-              </div>
-
-              {/* DETERMINISTIC EXPLANATION */}
-              <div className="space-y-1.5 pt-2 border-t border-[#27272a]">
-                <div className="text-[11px] font-bold uppercase tracking-wider text-[#a1a1aa]">EXPLANATION</div>
-                <p className="text-xs text-[#d4d4d8] leading-relaxed">{selectedFinding.explanation}</p>
-              </div>
-
-              {/* RECOMMENDATION */}
-              <div className="space-y-1.5 pt-2 border-t border-[#27272a]">
-                <div className="text-[11px] font-bold uppercase tracking-wider text-[#a1a1aa]">RECOMMENDATION</div>
-                <p className="text-xs text-[#d4d4d8] leading-relaxed">{selectedFinding.recommendation}</p>
-              </div>
-
-              {/* ACTION BUTTONS */}
-              <div className="space-y-2 pt-3">
-                {selectedFinding.evidence.length > 0 && (
-                  <button
-                    onClick={() =>
-                      handleOpenConsumer(
-                        selectedFinding.evidence[0].file,
-                        selectedFinding.evidence[0].line
-                      )
-                    }
-                    className="w-full h-8 bg-[#0284c7] hover:bg-[#0369a1] text-white font-medium text-xs rounded flex items-center justify-center gap-1.5 transition cursor-pointer shadow"
-                  >
-                    <span>Open {selectedFinding.evidence[0].file}</span>
-                    <ExternalLink className="w-3.5 h-3.5" />
-                  </button>
-                )}
-
-                <button
-                  onClick={() => setShowExplanationModal(true)}
-                  className="w-full h-8 bg-[#202024] hover:bg-[#27272a] border border-[#2e2e34] text-[#d4d4d8] font-medium text-xs rounded flex items-center justify-center gap-1.5 transition cursor-pointer"
-                >
-                  <HelpCircle className="w-3.5 h-3.5 text-[#71717a]" />
-                  <span>Why is this a problem?</span>
-                </button>
-              </div>
+              )}
             </div>
-          ) : (
-            <div className="p-6 text-center text-xs text-[#71717a]">
-              No breaking findings detected for this PR.
-            </div>
-          )}
-        </aside>
-      </div>
+          </div>
+        )}
+      </main>
 
-      {/* Live Git Provider PR/MR Fetch Modal */}
+      {/* Modal: Link Remote PR / MR */}
       {showFetchModal && (
-        <div className="fixed inset-0 bg-black/70 backdrop-blur-xs flex items-center justify-center z-50 p-4">
-          <div className="w-full max-w-lg bg-[#18181b] border border-[#27272a] rounded-lg shadow-2xl p-5 space-y-4">
-            <div className="flex items-center justify-between border-b border-[#27272a] pb-3">
-              <div className="flex items-center space-x-2">
-                <DownloadCloud className="w-4 h-4 text-[#38bdf8]" />
-                <h3 className="text-sm font-bold text-white">Fetch Live GitHub PR or GitLab MR</h3>
-              </div>
-              <button onClick={() => setShowFetchModal(false)} className="text-[#71717a] hover:text-white">
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-xl max-w-lg w-full p-5 shadow-2xl flex flex-col gap-4">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                <FolderGit2 className="w-4 h-4 text-blue-400" />
+                <span>Link Remote Repository or PR / MR</span>
+              </h3>
+              <button
+                onClick={() => setShowFetchModal(false)}
+                className="text-slate-400 hover:text-white p-1 rounded-lg"
+              >
                 <X className="w-4 h-4" />
               </button>
             </div>
 
-            {/* Provider Selector Tabs */}
-            <div className="flex items-center gap-2 p-1 bg-[#141416] border border-[#27272a] rounded">
-              <button
-                type="button"
-                onClick={() => setProviderMode('auto')}
-                className={`flex-1 py-1.5 px-2 rounded text-xs font-medium flex items-center justify-center gap-1.5 transition cursor-pointer ${
-                  providerMode === 'auto'
-                    ? 'bg-[#27272a] text-white shadow-xs'
-                    : 'text-[#71717a] hover:text-[#d4d4d8]'
-                }`}
-              >
-                <Globe className="w-3.5 h-3.5 text-[#38bdf8]" />
-                <span>Auto Detect URL</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setProviderMode('github')}
-                className={`flex-1 py-1.5 px-2 rounded text-xs font-medium flex items-center justify-center gap-1.5 transition cursor-pointer ${
-                  providerMode === 'github'
-                    ? 'bg-[#27272a] text-white shadow-xs'
-                    : 'text-[#71717a] hover:text-[#d4d4d8]'
-                }`}
-              >
-                <GitHubIcon className="w-3.5 h-3.5" />
-                <span>GitHub (PR)</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setProviderMode('gitlab')}
-                className={`flex-1 py-1.5 px-2 rounded text-xs font-medium flex items-center justify-center gap-1.5 transition cursor-pointer ${
-                  providerMode === 'gitlab'
-                    ? 'bg-[#27272a] text-white shadow-xs'
-                    : 'text-[#71717a] hover:text-[#d4d4d8]'
-                }`}
-              >
-                <GitLabIcon className="w-3.5 h-3.5" />
-                <span>GitLab (MR)</span>
-              </button>
-            </div>
-
-            <div className="space-y-3 text-xs text-[#d4d4d8]">
+            <div className="flex flex-col gap-3">
               <div>
-                <div className="flex items-center justify-between mb-1">
-                  <label className="block text-[11px] font-semibold text-[#a1a1aa]">
-                    {detectedTarget.target?.provider === 'gitlab'
-                      ? 'GitLab Project Path or MR URL'
-                      : 'GitHub Repository or PR URL'}
-                  </label>
-                  {detectedTarget.target && (
-                    <span className="flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider text-[#38bdf8]">
-                      {detectedTarget.target.provider === 'gitlab' ? (
-                        <>
-                          <GitLabIcon className="w-3 h-3" />
-                          <span>Detected: GitLab ({detectedTarget.target.host || 'gitlab.com'})</span>
-                        </>
-                      ) : (
-                        <>
-                          <GitHubIcon className="w-3 h-3" />
-                          <span>Detected: GitHub (api.github.com)</span>
-                        </>
-                      )}
-                    </span>
-                  )}
-                </div>
+                <label className="text-xs font-semibold text-slate-300 block mb-1">
+                  GitHub / GitLab Repository URL or Name:
+                </label>
                 <input
                   type="text"
                   value={gitRepoInput}
-                  onChange={(e) => {
-                    const val = e.target.value;
-                    setGitRepoInput(val);
-                    setFetchError(null);
-                    const parsed = parseGitUrlOrInput(
-                      val,
-                      gitNumberInput,
-                      providerMode === 'auto' ? undefined : providerMode
-                    );
-                    if (parsed.target?.number) {
-                      setGitNumberInput(parsed.target.number.toString());
-                    }
-                  }}
-                  placeholder="e.g. facebook/react/pull/28000 or gitlab-org/gitlab/-/merge_requests/120000"
-                  className="w-full bg-[#141416] border border-[#27272a] rounded px-3 py-2 text-xs text-white focus:border-[#38bdf8] outline-none font-mono placeholder:font-sans"
+                  onChange={(e) => setGitRepoInput(e.target.value)}
+                  placeholder="e.g. facebook/react/pull/28000 or gitlab-org/gitlab"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-100 focus:outline-none focus:border-blue-500 font-mono"
                 />
               </div>
 
               <div>
-                <label className="block text-[11px] font-semibold text-[#a1a1aa] mb-1">
-                  {detectedTarget.target?.typeLabel === 'MR' ? 'Merge Request (MR) IID' : 'Pull Request (PR) Number'}
+                <label className="text-xs font-semibold text-slate-300 block mb-1">
+                  PR / MR Number:
                 </label>
                 <input
                   type="number"
                   value={gitNumberInput}
-                  onChange={(e) => {
-                    setGitNumberInput(e.target.value);
-                    setFetchError(null);
-                  }}
+                  onChange={(e) => setGitNumberInput(e.target.value)}
                   placeholder="e.g. 28000"
-                  className="w-full bg-[#141416] border border-[#27272a] rounded px-3 py-2 text-xs text-white focus:border-[#38bdf8] outline-none font-mono placeholder:font-sans"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-100 focus:outline-none focus:border-blue-500 font-mono"
                 />
               </div>
 
-              {/* Quick Preset Buttons for BOTH GitHub and GitLab */}
               <div>
-                <span className="block text-[10px] uppercase font-bold tracking-wider text-[#71717a] mb-1.5">
-                  Try Live Examples:
-                </span>
-                <div className="space-y-1.5">
-                  <div className="flex items-center gap-1.5 flex-wrap">
-                    <span className="text-[10px] text-[#a1a1aa] w-14 font-semibold flex items-center gap-1">
-                      <GitHubIcon className="w-3 h-3" /> GitHub:
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setProviderMode('github');
-                        setGitRepoInput('facebook/react');
-                        setGitNumberInput('28000');
-                        setFetchError(null);
-                      }}
-                      className="px-2 py-0.5 rounded bg-[#202024] hover:bg-[#27272a] text-[#38bdf8] border border-[#2e2e34] text-[11px] font-mono transition"
-                    >
-                      facebook/react #28000
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setProviderMode('github');
-                        setGitRepoInput('reduxjs/redux');
-                        setGitNumberInput('4500');
-                        setFetchError(null);
-                      }}
-                      className="px-2 py-0.5 rounded bg-[#202024] hover:bg-[#27272a] text-[#38bdf8] border border-[#2e2e34] text-[11px] font-mono transition"
-                    >
-                      reduxjs/redux #4500
-                    </button>
-                  </div>
-
-                  <div className="flex items-center gap-1.5 flex-wrap">
-                    <span className="text-[10px] text-[#a1a1aa] w-14 font-semibold flex items-center gap-1">
-                      <GitLabIcon className="w-3 h-3" /> GitLab:
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setProviderMode('gitlab');
-                        setGitRepoInput('gitlab-org/gitlab');
-                        setGitNumberInput('120000');
-                        setFetchError(null);
-                      }}
-                      className="px-2 py-0.5 rounded bg-[#202024] hover:bg-[#27272a] text-[#fc6d26] border border-[#2e2e34] text-[11px] font-mono transition"
-                    >
-                      gitlab-org/gitlab !120000
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setProviderMode('gitlab');
-                        setGitRepoInput('gitlab-org/gitlab-runner');
-                        setGitNumberInput('4500');
-                        setFetchError(null);
-                      }}
-                      className="px-2 py-0.5 rounded bg-[#202024] hover:bg-[#27272a] text-[#fc6d26] border border-[#2e2e34] text-[11px] font-mono transition"
-                    >
-                      gitlab-org/gitlab-runner !4500
-                    </button>
-                  </div>
-                </div>
-              </div>
-
-              {/* Personal Access Token (PAT) Section */}
-              <div className="pt-2 border-t border-[#27272a]/70 space-y-2">
-                <div className="flex items-center justify-between">
-                  <label className="flex items-center gap-1.5 text-[11px] font-semibold text-[#a1a1aa]">
-                    <Key className="w-3.5 h-3.5 text-[#eab308]" />
-                    <span>Personal Access Token (PAT)</span>
-                    <span className="text-[#71717a] font-normal text-[10px]">(Required for private repos)</span>
-                  </label>
-                  <button
-                    type="button"
-                    onClick={() => setShowTokenHelp(!showTokenHelp)}
-                    className="text-[11px] text-[#38bdf8] hover:underline flex items-center gap-1 cursor-pointer"
-                  >
-                    <HelpCircle className="w-3 h-3" />
-                    <span>{showTokenHelp ? 'Hide instructions' : 'How to create PAT?'}</span>
-                  </button>
-                </div>
-
-                {/* Token Input with Validate Button */}
-                <div className="flex items-center gap-2">
-                  <div className="relative flex-1">
-                    <input
-                      type="password"
-                      value={gitTokenInput}
-                      onChange={(e) => {
-                        setGitTokenInput(e.target.value);
-                        setTokenValidation(null);
-                        setFetchError(null);
-                      }}
-                      placeholder={
-                        detectedTarget.target?.provider === 'gitlab'
-                          ? 'glpat-... (GitLab Personal Access Token)'
-                          : 'ghp_... (GitHub Personal Access Token)'
-                      }
-                      className="w-full bg-[#141416] border border-[#27272a] rounded px-3 py-2 text-xs text-white focus:border-[#38bdf8] outline-none font-mono placeholder:font-sans pr-8"
-                    />
-                    {gitTokenInput && (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setGitTokenInput('');
-                          setTokenValidation(null);
-                          try {
-                            localStorage.removeItem('pr_sentinel_pat_github');
-                            localStorage.removeItem('pr_sentinel_pat_gitlab');
-                          } catch {}
-                        }}
-                        className="absolute right-2 top-2.5 text-[#71717a] hover:text-white text-xs cursor-pointer"
-                        title="Clear token"
-                      >
-                        <X className="w-3.5 h-3.5" />
-                      </button>
-                    )}
-                  </div>
-
-                  <button
-                    type="button"
-                    onClick={() => handleValidateToken()}
-                    disabled={isValidatingToken || !gitTokenInput.trim()}
-                    className="px-3 py-2 bg-[#27272a] hover:bg-[#323238] disabled:opacity-40 text-xs text-[#e4e4e7] font-medium rounded border border-[#3f3f46] flex items-center gap-1.5 transition cursor-pointer shrink-0"
-                  >
-                    {isValidatingToken ? (
-                      <>
-                        <RefreshCw className="w-3 h-3 animate-spin text-[#38bdf8]" />
-                        <span>Validating...</span>
-                      </>
-                    ) : (
-                      <>
-                        <ShieldCheck className="w-3.5 h-3.5 text-[#22c55e]" />
-                        <span>Validate Token</span>
-                      </>
-                    )}
-                  </button>
-                </div>
-
-                {/* Token Validation Feedback */}
-                {tokenValidation && (
-                  <div
-                    className={`p-2.5 rounded border text-xs leading-relaxed transition ${
-                      tokenValidation.valid
-                        ? 'bg-[#052e16]/60 border-[#166534] text-[#86efac]'
-                        : 'bg-[#450a0a]/60 border-[#991b1b] text-[#fca5a5]'
-                    }`}
-                  >
-                    {tokenValidation.valid ? (
-                      <div className="flex items-start justify-between gap-2">
-                        <div className="space-y-1">
-                          <div className="flex items-center gap-1.5 font-semibold text-[#4ade80]">
-                            <CheckCircle className="w-3.5 h-3.5 text-[#22c55e] shrink-0" />
-                            <span>PAT Validated &amp; Active</span>
-                            {tokenValidation.username && (
-                              <span className="text-white font-mono font-normal">
-                                (@{tokenValidation.username})
-                              </span>
-                            )}
-                          </div>
-                          <div className="text-[11px] text-[#bbf7d0] flex items-center gap-2 flex-wrap">
-                            {tokenValidation.scopes && tokenValidation.scopes.length > 0 && (
-                              <span>Scopes: {tokenValidation.scopes.join(', ')}</span>
-                            )}
-                            {tokenValidation.rateLimit && (
-                              <span className="text-[#86efac]/80">
-                                • API Rate Limit: {tokenValidation.rateLimit.remaining} / {tokenValidation.rateLimit.limit} req/hr
-                              </span>
-                            )}
-                          </div>
-                        </div>
-                        <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-[#16a34a]/30 text-[#4ade80] uppercase tracking-wider shrink-0">
-                          Ready
-                        </span>
-                      </div>
-                    ) : (
-                      <div className="flex items-start gap-2">
-                        <XCircle className="w-3.5 h-3.5 text-[#ef4444] shrink-0 mt-0.5" />
-                        <div>
-                          <div className="font-semibold text-red-200">Validation Failed</div>
-                          <div className="text-[11px] text-red-300">{tokenValidation.error}</div>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                )}
-
-                {/* Token Help Guide */}
-                {showTokenHelp && (
-                  <div className="p-3 bg-[#202024] border border-[#2e2e34] rounded text-[11px] text-[#a1a1aa] space-y-2">
-                    <div className="font-bold text-white flex items-center gap-1.5">
-                      <Lock className="w-3.5 h-3.5 text-[#eab308]" />
-                      <span>Accessing Private Repositories</span>
-                    </div>
-                    {detectedTarget.target?.provider === 'gitlab' ? (
-                      <div className="space-y-1 text-[#d4d4d8] leading-relaxed">
-                        <p>1. In GitLab, navigate to <strong>User Settings &gt; Access Tokens</strong>.</p>
-                        <p>2. Create a token with <strong>read_api</strong> and <strong>read_repository</strong> scopes.</p>
-                        <p>3. Paste the token above and click <strong>Validate Token</strong>.</p>
-                      </div>
-                    ) : (
-                      <div className="space-y-1 text-[#d4d4d8] leading-relaxed">
-                        <p>1. In GitHub, go to <strong>Settings &gt; Developer settings &gt; Personal access tokens &gt; Tokens (classic)</strong>.</p>
-                        <p>2. Generate a token selecting the <strong>repo</strong> (Full control of private repositories) scope.</p>
-                        <p>3. Paste the token above and click <strong>Validate Token</strong>.</p>
-                      </div>
-                    )}
-                  </div>
-                )}
+                <label className="text-xs font-semibold text-slate-300 block mb-1">
+                  Personal Access Token (for Private Repos / 5,000 req/hr):
+                </label>
+                <input
+                  type="password"
+                  value={gitTokenInput}
+                  onChange={(e) => setGitTokenInput(e.target.value)}
+                  placeholder="ghp_... or glpat-..."
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-100 focus:outline-none focus:border-blue-500 font-mono"
+                />
               </div>
 
               {fetchError && (
-                <div className="p-3 rounded bg-red-950/70 border border-red-800/80 text-red-300 text-xs leading-relaxed space-y-2">
-                  <div className="font-bold flex items-center gap-1.5 text-red-200">
-                    <AlertTriangle className="w-3.5 h-3.5 text-red-400 shrink-0" />
-                    <span>Unable to fetch {detectedTarget.target?.typeLabel || 'PR/MR'}</span>
-                  </div>
-                  <div>{fetchError}</div>
-                  {!gitTokenInput && (
-                    <div className="pt-1.5 border-t border-red-900/60 text-[11px] text-red-200 flex items-center gap-1.5">
-                      <Key className="w-3 h-3 text-[#eab308] shrink-0" />
-                      <span>If this repository is private, provide a Personal Access Token with repo read permission above and click Validate.</span>
-                    </div>
-                  )}
+                <div className="bg-rose-950/40 border border-rose-500/30 text-rose-300 p-2.5 rounded-lg text-xs">
+                  {fetchError}
                 </div>
               )}
             </div>
 
-            <div className="flex justify-end gap-2 pt-2 border-t border-[#27272a]">
+            <div className="flex items-center justify-end gap-2 border-t border-slate-800 pt-3">
               <button
                 onClick={() => setShowFetchModal(false)}
-                className="px-3 py-1.5 bg-[#202024] hover:bg-[#27272a] text-[#d4d4d8] text-xs font-medium rounded cursor-pointer"
+                className="px-3 py-1.5 rounded-lg text-xs font-medium text-slate-300 hover:bg-slate-800"
               >
                 Cancel
               </button>
               <button
-                onClick={handleFetchRemotePrOrMr}
-                disabled={isFetchingRemote || isValidatingToken}
-                className="px-4 py-1.5 bg-[#0284c7] hover:bg-[#0369a1] text-white text-xs font-medium rounded flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                onClick={() => handleFetchRemotePrOrMr()}
+                disabled={isFetchingRemote}
+                className="bg-blue-600 hover:bg-blue-500 text-white text-xs px-4 py-1.5 rounded-lg font-semibold transition-colors flex items-center gap-1.5"
               >
-                {isFetchingRemote ? (
-                  <>
-                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                    <span>Calling {detectedTarget.target?.provider === 'gitlab' ? 'GitLab v4' : 'GitHub v3'} API...</span>
-                  </>
-                ) : (
-                  <>
-                    <DownloadCloud className="w-3.5 h-3.5" />
-                    <span>
-                      {tokenValidation?.valid ? 'Validate & Review ' : 'Fetch & Analyze '}
-                      {detectedTarget.target?.provider === 'gitlab' ? 'GitLab MR' : 'GitHub PR'}
-                    </span>
-                  </>
-                )}
+                {isFetchingRemote && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
+                <span>{isFetchingRemote ? 'Fetching & Analyzing...' : 'Fetch & Review'}</span>
               </button>
             </div>
           </div>
         </div>
       )}
 
-      {/* Contract Mismatch Explainer Modal */}
-      {showExplanationModal && selectedFinding && (
-        <div className="fixed inset-0 bg-black/70 backdrop-blur-xs flex items-center justify-center z-50 p-4">
-          <div className="w-full max-w-lg bg-[#18181b] border border-[#27272a] rounded-lg shadow-2xl p-5 space-y-4">
-            <div className="flex items-center justify-between border-b border-[#27272a] pb-3">
-              <div className="flex items-center space-x-2">
-                <Shield className="w-4 h-4 text-[#ef4444]" />
-                <h3 className="text-sm font-bold text-white">Deterministic AST Evidence &amp; Blast Radius</h3>
-              </div>
-              <button onClick={() => setShowExplanationModal(false)} className="text-[#71717a] hover:text-white">
+      {/* Modal: Export Review Markdown */}
+      {showExportModal && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-xl max-w-2xl w-full p-5 shadow-2xl flex flex-col gap-4 max-h-[85vh]">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                <DownloadCloud className="w-4 h-4 text-blue-400" />
+                <span>Export Formatted Markdown Code Review</span>
+              </h3>
+              <button
+                onClick={() => setShowExportModal(false)}
+                className="text-slate-400 hover:text-white p-1 rounded-lg"
+              >
                 <X className="w-4 h-4" />
               </button>
             </div>
 
-            <div className="space-y-3 text-xs text-[#d4d4d8]">
-              <p className="leading-relaxed">
-                Deterministic AST parsing identified that symbol{' '}
-                <code className="text-[#38bdf8] font-mono">{selectedFinding.title}</code> was altered in the {currentTypeLabel} diff:
-              </p>
+            <p className="text-xs text-slate-300">
+              This review is ready to be posted as a PR comment or review summary on GitHub / GitLab.
+            </p>
 
-              <div className="bg-[#141416] p-3 rounded font-mono text-[11px] space-y-2 border border-[#27272a]">
-                <div className="text-[#a1a1aa] font-bold">REMOVED VARIANTS</div>
-                <div className="text-red-400">{selectedFinding.oldValue}</div>
+            <pre className="flex-1 bg-slate-950 border border-slate-800 rounded-lg p-3 text-xs font-mono text-slate-300 overflow-y-auto whitespace-pre-wrap">
+              {reviewReport.generatedMarkdownReview}
+            </pre>
 
-                <div className="text-[#22c55e] font-bold pt-1">ADDED VARIANTS</div>
-                <div className="text-emerald-400">{selectedFinding.newValue}</div>
-              </div>
-
-              <p className="text-[11px] text-[#a1a1aa]">
-                The Reference Analyzer scanned all project AST nodes and isolated{' '}
-                {selectedFinding.affectedConsumersCount} direct consumer site(s) requiring code updates.
-              </p>
-            </div>
-
-            <div className="flex justify-end pt-2 border-t border-[#27272a]">
+            <div className="flex items-center justify-between border-t border-slate-800 pt-3">
               <button
-                onClick={() => setShowExplanationModal(false)}
-                className="px-4 py-1.5 bg-[#0284c7] hover:bg-[#0369a1] text-white text-xs font-medium rounded cursor-pointer"
+                onClick={handleCopyReviewMarkdown}
+                className="bg-blue-600 hover:bg-blue-500 text-white text-xs px-4 py-1.5 rounded-lg font-semibold transition-colors flex items-center gap-1.5"
+              >
+                {copiedReview ? <CheckCheck className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                <span>{copiedReview ? 'Copied to Clipboard!' : 'Copy to Clipboard'}</span>
+              </button>
+
+              <button
+                onClick={() => setShowExportModal(false)}
+                className="px-3 py-1.5 rounded-lg text-xs font-medium text-slate-300 hover:bg-slate-800"
               >
                 Close
               </button>
@@ -1305,42 +1104,6 @@ export default function App() {
           </div>
         </div>
       )}
-
-      {/* VS Code Bottom Status Bar */}
-      <footer className="h-6 bg-[#0284c7] text-white flex items-center px-3 justify-between text-[11px] shrink-0 select-none">
-        <div className="flex items-center space-x-3">
-          <div className="flex items-center space-x-1 hover:bg-[#0369a1] px-2 h-full cursor-pointer">
-            <GitBranch className="w-3.5 h-3.5" />
-            <span>{scenario.pr.branchName || 'main'}*</span>
-            <ArrowRight className="w-3 h-3 mx-0.5" />
-          </div>
-          <div className="flex items-center space-x-2">
-            <span>⊗ {analysisResult.metrics.breakingCount}</span>
-            <span>⚠ {analysisResult.metrics.warningCount}</span>
-          </div>
-        </div>
-
-        <div className="flex items-center space-x-4">
-          <span className="flex items-center gap-1">
-            {currentProvider === 'gitlab' ? (
-              <GitLabIcon className="w-3 h-3" />
-            ) : (
-              <GitHubIcon className="w-3 h-3" />
-            )}
-            <span>{currentProvider === 'gitlab' ? 'GitLab REST v4' : 'GitHub REST v3'}</span>
-          </span>
-          <span>Spaces: 2</span>
-          <span>UTF-8</span>
-          <span className="flex items-center gap-1">
-            <Code2 className="w-3 h-3" />
-            TypeScript Compiler API
-          </span>
-          <span className="flex items-center gap-1">
-            <CheckCircle className="w-3 h-3" />
-            Active
-          </span>
-        </div>
-      </footer>
     </div>
   );
 }

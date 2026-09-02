@@ -68,3 +68,8 @@ export class PatchParser {
     };
   }
 }
+
+export function parsePatch(filename: string, patchText: string): ParsedPatch {
+  return new PatchParser().parsePatch(filename, patchText);
+}
+

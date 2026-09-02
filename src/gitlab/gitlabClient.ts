@@ -244,4 +244,50 @@ export class GitLabClient {
       };
     });
   }
+
+  /**
+   * Lists Merge Requests for a GitLab project
+   */
+  async listMergeRequests(
+    projectPath: string,
+    state: 'opened' | 'closed' | 'merged' | 'all' = 'opened',
+    perPage = 30
+  ): Promise<PullRequestInfo[]> {
+    const encodedProject = encodeURIComponent(projectPath.trim());
+    const url = `${this.baseUrl}/projects/${encodedProject}/merge_requests?state=${state}&per_page=${perPage}&order_by=updated_at&sort=desc`;
+
+    const response = await fetch(url, {
+      headers: this.getHeaders(),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Failed to list merge requests for "${projectPath}": ${errorText}`);
+    }
+
+    const mrs = await response.json();
+    const parts = projectPath.split('/');
+    const repo = parts.pop() || projectPath;
+    const owner = parts.join('/') || 'gitlab';
+
+    return mrs.map((data: any) => ({
+      provider: 'gitlab' as const,
+      typeLabel: 'MR' as const,
+      owner,
+      repository: repo,
+      projectPath,
+      number: data.iid,
+      title: data.title,
+      baseSha: data.diff_refs?.base_sha || data.diff_refs?.start_sha || 'base',
+      headSha: data.diff_refs?.head_sha || data.sha || 'head',
+      htmlUrl: data.web_url,
+      branchName: data.source_branch,
+      baseBranch: data.target_branch,
+      author: data.author?.username || data.author?.name || 'gitlab-user',
+      authorAvatar: data.author?.avatar_url,
+      updatedAt: data.updated_at || data.created_at,
+      createdAt: data.created_at,
+      state: data.state === 'opened' ? 'open' : data.state,
+    }));
+  }
 }

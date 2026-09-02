@@ -3,6 +3,7 @@ import {
   parseGitUrlOrInput,
   fetchRemotePullOrMergeRequest,
   validateRemoteToken,
+  listRemotePullOrMergeRequests,
   ParsedGitTarget,
   GitProviderType,
 } from '../git/gitProvider';
@@ -10,7 +11,9 @@ import { parseAllChangedFiles } from '../github/pullRequest';
 import { DeterministicPipeline } from '../pipeline/deterministicPipeline';
 import { ProjectFileSource } from '../analyzer/projectScanner';
 import { FindingsViewProvider, FindingsPanel } from '../ui/findingsView';
-import { Finding, PullRequestInfo, ChangedFile } from '../models/types';
+import { Finding, PullRequestInfo, ChangedFile, PRReviewReport } from '../models/types';
+import { CodeReviewer } from '../reviewer/codeReviewer';
+import { RepoLinker } from '../reviewer/repoLinker';
 
 /**
  * Discovers repository target from local git remotes if available
@@ -177,6 +180,176 @@ async function collectWorkspaceSources(): Promise<ProjectFileSource[]> {
 }
 
 /**
+ * Core function that executes PR fetch, deterministic AST scan, and Senior Code Review
+ */
+export async function executePRAnalysisAndReview(
+  context: vscode.ExtensionContext,
+  target: ParsedGitTarget,
+  findingsViewProvider?: FindingsViewProvider
+): Promise<void> {
+  const targetIdentifier =
+    target.provider === 'gitlab' ? target.projectPath : `${target.owner}/${target.repo}`;
+
+  let token = await getStoredToken(context, target.provider);
+
+  let fetchResult;
+  let attemptFetch = async (currentToken?: string) => {
+    return await fetchRemotePullOrMergeRequest(target, currentToken);
+  };
+
+  try {
+    fetchResult = await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: `PR Sentinel: Fetching ${target.typeLabel} #${target.number} from ${targetIdentifier}...`,
+        cancellable: false,
+      },
+      async (progress) => {
+        progress.report({ message: 'Connecting to API...' });
+        return await attemptFetch(token);
+      }
+    );
+  } catch (fetchErr: any) {
+    const errMsg = fetchErr?.message || String(fetchErr);
+    const isAuthError =
+      errMsg.includes('404') ||
+      errMsg.includes('401') ||
+      errMsg.includes('403') ||
+      errMsg.includes('Not Found') ||
+      errMsg.includes('rate limit');
+
+    if (isAuthError) {
+      const action = await vscode.window.showWarningMessage(
+        `PR Sentinel: ${target.typeLabel} #${target.number} not found on "${targetIdentifier}" (or repository is private/rate-limited).`,
+        'Enter Access Token (PAT)',
+        'Cancel'
+      );
+
+      if (action === 'Enter Access Token (PAT)') {
+        const newToken = await promptAndStoreToken(
+          context,
+          target.provider,
+          target.host,
+          `Enter Personal Access Token for ${
+            target.provider === 'gitlab' ? 'GitLab' : 'GitHub'
+          } to access "${targetIdentifier}":`
+        );
+        if (newToken) {
+          token = newToken;
+          fetchResult = await vscode.window.withProgress(
+            {
+              location: vscode.ProgressLocation.Notification,
+              title: `PR Sentinel: Retrying ${target.typeLabel} #${target.number} with authentication...`,
+              cancellable: false,
+            },
+            async () => await attemptFetch(token)
+          );
+        } else {
+          return;
+        }
+      } else {
+        return;
+      }
+    } else {
+      throw fetchErr;
+    }
+  }
+
+  if (!fetchResult) {
+    return;
+  }
+
+  const { prInfo, changedFiles } = fetchResult;
+
+  // Run AST Blast Radius Pipeline + Senior Code Reviewer
+  await vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: `PR Sentinel: Reviewing Code & Blast Radius for ${target.typeLabel} #${target.number}...`,
+      cancellable: false,
+    },
+    async (progress) => {
+      progress.report({ message: 'Analyzing AST changes and code quality...' });
+
+      const workspaceSources = await collectWorkspaceSources();
+
+      // 1. AST Blast Radius Pipeline
+      const pipeline = new DeterministicPipeline();
+      const analysisResult = pipeline.run(prInfo, changedFiles, workspaceSources);
+
+      // 2. Senior Code Reviewer Engine (Architecture, Security, Performance, Good vs Bad Fixes)
+      const reviewer = new CodeReviewer();
+      const reviewReport = reviewer.reviewPullRequest(
+        prInfo,
+        changedFiles,
+        analysisResult.findings,
+        workspaceSources
+      );
+
+      // 3. Update Webview Providers
+      if (findingsViewProvider) {
+        findingsViewProvider.updateFindings(
+          analysisResult.findings,
+          prInfo,
+          changedFiles,
+          reviewReport
+        );
+      }
+
+      // Display Dashboard Helper
+      const showDashboard = async () => {
+        try {
+          FindingsPanel.createOrShow(
+            context.extensionUri,
+            analysisResult.findings,
+            prInfo,
+            changedFiles,
+            reviewReport
+          );
+          await vscode.commands.executeCommand('workbench.view.extension.pr-sentinel');
+          await vscode.commands.executeCommand('prSentinel.findingsView.focus');
+        } catch (openErr) {
+          console.warn('Could not focus PR Sentinel panel:', openErr);
+        }
+      };
+
+      const breakingCount = analysisResult.metrics.breakingCount;
+      const issuesCount = reviewReport.items.length;
+      const verdictStr =
+        reviewReport.verdict === 'APPROVE'
+          ? '✅ Approved'
+          : reviewReport.verdict === 'REQUEST_CHANGES'
+          ? '⚠️ Changes Requested'
+          : reviewReport.verdict === 'CRITICAL_RISK'
+          ? '🛑 Critical Risk'
+          : '💬 Suggestions Available';
+
+      const summaryMessage = `PR Sentinel: [Score: ${reviewReport.overallScore}/100 | ${verdictStr}] - Found ${issuesCount} review item(s) & ${breakingCount} breaking change(s).`;
+
+      const choice = await vscode.window.showInformationMessage(
+        summaryMessage,
+        'View Code Review & Fixes',
+        'Copy Markdown Review',
+        'View Changed Files Diff'
+      );
+
+      if (choice === 'View Code Review & Fixes') {
+        await showDashboard();
+      } else if (choice === 'Copy Markdown Review') {
+        await vscode.env.clipboard.writeText(reviewReport.generatedMarkdownReview);
+        vscode.window.showInformationMessage('PR Sentinel: Full Markdown Review copied to clipboard!');
+      } else if (choice === 'View Changed Files Diff') {
+        const doc = await vscode.workspace.openTextDocument({
+          content: reviewReport.generatedMarkdownReview,
+          language: 'markdown',
+        });
+        await vscode.window.showTextDocument(doc, { preview: true });
+      }
+    }
+  );
+}
+
+/**
  * Register all PR Sentinel commands
  */
 export function registerCommands(
@@ -234,7 +407,11 @@ export function registerCommands(
         // 4. If PR number was not in the URL, prompt for it
         if (!target.number) {
           const prNumberInput = await vscode.window.showInputBox({
-            prompt: `Enter ${target.typeLabel} number for ${target.provider === 'gitlab' ? target.projectPath : target.owner + '/' + target.repo}`,
+            prompt: `Enter ${target.typeLabel} number for ${
+              target.provider === 'gitlab'
+                ? target.projectPath
+                : target.owner + '/' + target.repo
+            }`,
             placeHolder: 'e.g. 1',
             ignoreFocusOut: true,
             validateInput: (val) => {
@@ -256,150 +433,93 @@ export function registerCommands(
           };
         }
 
-        // 5. Fetch PR / MR with authentication support
-        let token = await getStoredToken(context, target.provider);
-
-        let fetchResult;
-        let attemptFetch = async (currentToken?: string) => {
-          return await fetchRemotePullOrMergeRequest(
-            target,
-            currentToken
-          );
-        };
-
-        const targetIdentifier = target.provider === 'gitlab' ? target.projectPath : `${target.owner}/${target.repo}`;
-
-        try {
-          fetchResult = await vscode.window.withProgress(
-            {
-              location: vscode.ProgressLocation.Notification,
-              title: `PR Sentinel: Fetching ${target.typeLabel} #${target.number} from ${targetIdentifier}...`,
-              cancellable: false,
-            },
-            async (progress) => {
-              progress.report({ message: 'Connecting to API...' });
-              return await attemptFetch(token);
-            }
-          );
-        } catch (fetchErr: any) {
-          const errMsg = fetchErr?.message || String(fetchErr);
-          const isAuthError =
-            errMsg.includes('404') ||
-            errMsg.includes('401') ||
-            errMsg.includes('403') ||
-            errMsg.includes('Not Found') ||
-            errMsg.includes('rate limit');
-
-          if (isAuthError) {
-            const action = await vscode.window.showWarningMessage(
-              `PR Sentinel: ${target.typeLabel} #${target.number} not found on "${targetIdentifier}" (or repository is private/rate-limited).`,
-              'Enter Access Token (PAT)',
-              'Cancel'
-            );
-
-            if (action === 'Enter Access Token (PAT)') {
-              const newToken = await promptAndStoreToken(
-                context,
-                target.provider,
-                target.host,
-                `Enter Personal Access Token for ${target.provider === 'gitlab' ? 'GitLab' : 'GitHub'} to access "${targetIdentifier}":`
-              );
-              if (newToken) {
-                token = newToken;
-                fetchResult = await vscode.window.withProgress(
-                  {
-                    location: vscode.ProgressLocation.Notification,
-                    title: `PR Sentinel: Retrying ${target.typeLabel} #${target.number} with authentication...`,
-                    cancellable: false,
-                  },
-                  async () => await attemptFetch(token)
-                );
-              } else {
-                return;
-              }
-            } else {
-              return;
-            }
-          } else {
-            throw fetchErr;
-          }
-        }
-
-        if (!fetchResult) {
-          return;
-        }
-
-        const { prInfo, changedFiles } = fetchResult;
-
-        // 6. Run Deterministic AST Blast Radius Pipeline
-        await vscode.window.withProgress(
-          {
-            location: vscode.ProgressLocation.Notification,
-            title: `PR Sentinel: Analyzing Blast Radius across workspace for PR #${target.number}...`,
-            cancellable: false,
-          },
-          async (progress) => {
-            progress.report({ message: 'Scanning workspace AST symbols...' });
-
-            const workspaceSources = await collectWorkspaceSources();
-            const pipeline = new DeterministicPipeline();
-            const analysisResult = pipeline.run(prInfo, changedFiles, workspaceSources);
-
-            // 7. Update Findings View & Panels
-            if (findingsViewProvider) {
-              findingsViewProvider.updateFindings(analysisResult.findings, prInfo, changedFiles);
-            }
-
-            const breakingCount = analysisResult.metrics.breakingCount;
-            const totalChanged = changedFiles.length;
-
-            const summaryMessage =
-              breakingCount > 0
-                ? `PR Sentinel: ⚠️ ${breakingCount} Breaking Change(s) detected in ${target.typeLabel} #${target.number} ("${prInfo.title}").`
-                : `PR Sentinel: ✅ ${target.typeLabel} #${target.number} analyzed successfully. 0 breaking changes across ${totalChanged} changed file(s).`;
-
-            // Function to display the blast radius details
-            const showBlastRadius = async () => {
-              try {
-                // 1. Open the interactive Blast Radius Editor Tab
-                FindingsPanel.createOrShow(
-                  context.extensionUri,
-                  analysisResult.findings,
-                  prInfo,
-                  changedFiles
-                );
-                // 2. Also open & focus the sidebar view
-                await vscode.commands.executeCommand('workbench.view.extension.pr-sentinel');
-                await vscode.commands.executeCommand('prSentinel.findingsView.focus');
-              } catch (openErr) {
-                console.warn('Could not focus sidebar container:', openErr);
-              }
-            };
-
-            const choice = await vscode.window.showInformationMessage(
-              summaryMessage,
-              'View Blast Radius Details',
-              'View Changed Files Diff'
-            );
-
-            if (choice === 'View Blast Radius Details') {
-              await showBlastRadius();
-            } else if (choice === 'View Changed Files Diff') {
-              const parsed = parseAllChangedFiles(changedFiles);
-              const doc = await vscode.workspace.openTextDocument({
-                content: `# ${target.typeLabel} #${prInfo.number}: ${prInfo.title}\n\n**Repository:** \`${target.owner}/${target.repo}\`\n**Base SHA:** \`${prInfo.baseSha}\`\n**Head SHA:** \`${prInfo.headSha}\`\n\n## Detected Findings (${analysisResult.findings.length}):\n${analysisResult.findings.map(f => `### ${f.severity === 'high' ? '🔴 BREAKING' : '🟠 WARNING'}: ${f.title}\n- File: \`${f.filePath}\`\n- Affected Consumers: ${f.affectedConsumersCount}\n- Explanation: ${f.explanation}\n- Recommendation: ${f.recommendation}`).join('\n\n')}\n\n## Changed Files (${changedFiles.length}):\n${changedFiles.map(f => ` • ${f.filename} (+${f.additions} -${f.deletions})`).join('\n')}`,
-                language: 'markdown',
-              });
-              await vscode.window.showTextDocument(doc, { preview: true });
-            }
-          }
-        );
+        await executePRAnalysisAndReview(context, target, findingsViewProvider);
       } catch (error: any) {
         console.error('PR Sentinel analysis error:', error);
         vscode.window.showErrorMessage(
           `PR Sentinel Error: ${error.message || error}`
         );
       }
+    }
+  );
+
+  // Command: Link Workspace Repository & Browse Open PRs
+  const linkRepoCommand = vscode.commands.registerCommand(
+    'pr-sentinel.linkRepo',
+    async () => {
+      try {
+        const detected = await detectGitRepository();
+        let target: ParsedGitTarget | null = detected;
+
+        if (!target) {
+          const input = await vscode.window.showInputBox({
+            prompt: 'Enter GitHub / GitLab repository to link (e.g. owner/repo)',
+            placeHolder: 'owner/repo or https://github.com/owner/repo',
+            ignoreFocusOut: true,
+          });
+          if (!input) return;
+          const parsed = parseGitUrlOrInput(input);
+          if (parsed.target) target = parsed.target;
+        }
+
+        if (!target) {
+          vscode.window.showWarningMessage('No repository target could be determined.');
+          return;
+        }
+
+        const token = await getStoredToken(context, target.provider);
+        const repoName = target.provider === 'gitlab' ? target.projectPath : `${target.owner}/${target.repo}`;
+
+        // Fetch open PRs
+        const prs = await vscode.window.withProgress(
+          {
+            location: vscode.ProgressLocation.Notification,
+            title: `PR Sentinel: Fetching open ${target.typeLabel}s for ${repoName}...`,
+            cancellable: false,
+          },
+          async () => {
+            return await listRemotePullOrMergeRequests(target!, token, 'open');
+          }
+        );
+
+        if (!prs || prs.length === 0) {
+          vscode.window.showInformationMessage(
+            `PR Sentinel: No open ${target.typeLabel}s found in ${repoName}.`
+          );
+          return;
+        }
+
+        const items = prs.map((pr) => ({
+          label: `${target!.typeLabel} #${pr.number}: ${pr.title}`,
+          description: `by @${pr.author || 'unknown'} • branch: ${pr.branchName || 'head'}`,
+          detail: `Updated: ${pr.updatedAt || pr.createdAt || 'recently'}`,
+          pr,
+        }));
+
+        const selected = await vscode.window.showQuickPick(items, {
+          placeHolder: `Select an open ${target.typeLabel} in ${repoName} to review`,
+          matchOnDescription: true,
+          matchOnDetail: true,
+        });
+
+        if (selected) {
+          const fullTarget: ParsedGitTarget = {
+            ...target,
+            number: selected.pr.number,
+          };
+          await executePRAnalysisAndReview(context, fullTarget, findingsViewProvider);
+        }
+      } catch (err: any) {
+        vscode.window.showErrorMessage(`Failed to link repository: ${err.message || err}`);
+      }
+    }
+  );
+
+  // Command: Full Staff Code Review
+  const reviewPRCommand = vscode.commands.registerCommand(
+    'pr-sentinel.reviewPR',
+    async () => {
+      vscode.commands.executeCommand('pr-sentinel.analyzePR');
     }
   );
 
@@ -445,6 +565,8 @@ export function registerCommands(
   );
 
   context.subscriptions.push(analyzePRCommand);
+  context.subscriptions.push(linkRepoCommand);
+  context.subscriptions.push(reviewPRCommand);
   context.subscriptions.push(setTokenCommand);
   context.subscriptions.push(clearTokenCommand);
 }

@@ -309,4 +309,45 @@ export class GitHubClient {
       rawUrl: f.raw_url,
     }));
   }
+
+  /**
+   * Lists open Pull Requests for a repository
+   */
+  public async listPullRequests(
+    owner: string,
+    repository: string,
+    state: 'open' | 'closed' | 'all' = 'open',
+    perPage = 30
+  ): Promise<PullRequestInfo[]> {
+    const url = `${this.baseUrl}/repos/${owner}/${repository}/pulls?state=${state}&per_page=${perPage}&sort=updated&direction=desc`;
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: this.getHeaders(),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Failed to list pull requests for ${owner}/${repository}: ${errorText}`);
+    }
+
+    const prs = await response.json();
+    return prs.map((data: any) => ({
+      provider: 'github' as const,
+      typeLabel: 'PR' as const,
+      owner,
+      repository,
+      number: data.number,
+      title: data.title,
+      baseSha: data.base?.sha || '',
+      headSha: data.head?.sha || '',
+      htmlUrl: data.html_url,
+      branchName: data.head?.ref,
+      baseBranch: data.base?.ref,
+      author: data.user?.login,
+      authorAvatar: data.user?.avatar_url,
+      updatedAt: data.updated_at,
+      createdAt: data.created_at,
+      state: data.state,
+    }));
+  }
 }
